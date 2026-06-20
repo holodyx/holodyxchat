@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HolodyxChat</title>
+    <style>
+        :root {
+            --bg-color: #0e1621;
+            --panel-color: #17212b;
+            --text-color: #f5f5f5;
+            --accent-color: #2481cc;
+            --accent-hover: #2a96e8;
+            --input-bg: #202b36;
+            --border-color: #101924;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        .container {
+            background-color: var(--panel-color);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+            width: 100%;
+            max-width: 400px;
+            padding: 30px;
+            box-sizing: border-box;
+        }
+
+        h2 {
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 25px;
+            font-weight: 500;
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        input {
+            width: 100%;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            background-color: var(--input-bg);
+            color: var(--text-color);
+            font-size: 15px;
+            box-sizing: border-box;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            border-color: var(--accent-color);
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: none;
+            background-color: var(--accent-color);
+            color: white;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-top: 10px;
+        }
+
+        button:hover {
+            background-color: var(--accent-hover);
+        }
+
+        .secondary-btn {
+            background-color: transparent;
+            color: var(--accent-color);
+            margin-top: 5px;
+        }
+
+        .secondary-btn:hover {
+            background-color: rgba(36, 129, 204, 0.1);
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Окно чата */
+        #chat-window {
+            max-width: 600px;
+            height: 85vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #chat-box {
+            flex-grow: 1;
+            border: 1px solid var(--border-color);
+            background-color: var(--bg-color);
+            border-radius: 8px;
+            padding: 15px;
+            overflow-y: auto;
+            margin-bottom: 15px;
+        }
+
+        .message {
+            margin-bottom: 10px;
+            padding: 10px 14px;
+            border-radius: 10px;
+            background-color: var(--input-bg);
+            width: fit-content;
+            max-width: 80%;
+            word-break: break-word;
+        }
+
+        .chat-input-area {
+            display: flex;
+            gap: 10px;
+        }
+
+        .chat-input-area input {
+            flex-grow: 1;
+        }
+
+        .chat-input-area button {
+            width: auto;
+            margin-top: 0;
+            padding: 12px 24px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Окно входа и регистрации -->
+    <div id="auth-form" class="container">
+        <h2>HolodyxChat</h2>
+        <div class="input-group">
+            <input type="text" id="username" placeholder="Имя пользователя" autocomplete="off">
+        </div>
+        <div class="input-group">
+            <input type="password" id="password" placeholder="Пароль">
+        </div>
+        <button onclick="auth('/login')">Войти</button>
+        <button onclick="auth('/register')" class="secondary-btn">Создать аккаунт</button>
+    </div>
+
+    <!-- Окно чата -->
+    <div id="chat-window" class="container hidden">
+        <h2 id="chat-title">Чат</h2>
+        <div id="chat-box"></div>
+        <div class="chat-input-area">
+            <input type="text" id="message-text" placeholder="Напишите сообщение..." onkeypress="handleKeyPress(event)">
+            <button onclick="sendMessage()">Отправить</button>
+        </div>
+    </div>
+
+    <script>
+        let myUsername = "";
+        // Автоматически берет адрес текущего сервера (хоть localhost, хоть render)
+        const serverUrl = window.location.origin; 
+
+        async function auth(route) {
+            const user = document.getElementById('username').value.trim();
+            const pass = document.getElementById('password').value.trim();
+            
+            if (!user || !pass) {
+                alert('Пожалуйста, заполните все поля!');
+                return;
+            }
+            
+            try {
+                const response = await fetch(serverUrl + route, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username: user, password: pass})
+                });
+                
+                const result = await response.json();
+
+                if (response.ok) {
+                    if (route === '/login') {
+                        myUsername = user;
+                        startChat();
+                    } else {
+                        alert('Аккаунт успешно создан! Теперь введите данные и нажмите «Войти».');
+                    }
+                } else {
+                    alert('Ошибка: ' + (result.detail || result.error || 'Неверные данные'));
+                }
+            } catch (err) {
+                alert('Не удалось связаться с сервером. Убедитесь, что Python запущен!');
+            }
+        }
+
+        function startChat() {
+            document.getElementById('auth-form').classList.add('hidden');
+            document.getElementById('chat-window').classList.remove('hidden');
+            document.getElementById('chat-title').innerText = `HolodyxChat: ${myUsername}`;
+            
+            // Каждые 2 секунды скачиваем новые сообщения
+            loadMessages();
+            setInterval(loadMessages, 2000);
+        }
+
+        async function loadMessages() {
+            try {
+                const response = await fetch(serverUrl + '/messages');
+                const messages = await response.json();
+                const chatBox = document.getElementById('chat-box');
+                
+                // Проверяем, прокручен ли чат вниз
+                const isScrolledToBottom = chatBox.scrollHeight - chatBox.clientHeight <= chatBox.scrollTop + 50;
+                
+                chatBox.innerHTML = "";
+                messages.forEach(msg => {
+                    chatBox.innerHTML += `<div class="message"><b>${msg.sender}:</b> ${msg.text}</div>`;
+                });
+
+                // Если юзер читал низ чата, автопрокручиваем к новому сообщению
+                if (isScrolledToBottom) {
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            } catch (e) {
+                console.error("Ошибка при обновлении сообщений");
+            }
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('message-text');
+            const text = input.value.trim();
+            if (text === '') return;
+
+            input.value = ''; // Сразу очищаем поле ввода
+
+            try {
+                await fetch(serverUrl + '/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username: myUsername, text: text})
+                });
+                loadMessages();
+            } catch (e) {
+                alert('Не удалось отправить сообщение');
+            }
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+    </script>
+</body>
+</html>
