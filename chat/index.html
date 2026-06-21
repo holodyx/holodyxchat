@@ -24,7 +24,7 @@
         /* Список пользователей */
         .users-list-wrapper { flex: 1; overflow-y: auto; }
         .user-item { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #202b36; display: flex; align-items: center; justify-content: space-between; transition: 0.2s; }
-        .user-item * { pointer-events: none; } /* Важное исправление: клик не будет ломаться об внутренний текст */
+        .user-item * { pointer-events: none; }
         .user-item:hover { background: #24303f; }
         .user-item.active { background: #2b5278; }
         .user-item.hidden { display: none !important; }
@@ -132,6 +132,7 @@
         let listDiv = document.getElementById("usersList");
         listDiv.innerHTML = "";
         allUsersData.forEach(user => {
+            // Напоминание: твой собственный ник здесь скрывается, чтобы не писать самому себе.
             if (user.username !== myName) { 
                 let userBtn = document.createElement("div");
                 userBtn.classList.add("user-item");
@@ -143,7 +144,6 @@
                 
                 userBtn.innerHTML = `<div class="user-info"><strong>${user.username}</strong><span class="user-status-text ${onlineClass}">${statusText}</span></div><div class="status-dot ${onlineClass}"></div>`;
                 
-                // ИСПРАВЛЕНО: Безопасный клик, который точно сработает
                 userBtn.onclick = function(e) {
                     let targetName = e.currentTarget.getAttribute("data-username");
                     selectUser(targetName, e.currentTarget);
@@ -163,10 +163,22 @@
         });
     }
 
+    // ИСПРАВЛЕННАЯ ФУНКЦИЯ: Работает напрямую через массив данных, а не через клики по экрану
     function selectFirstFoundUser() {
-        let firstVisibleUser = document.querySelector(".user-item:not(.hidden)");
-        if (firstVisibleUser) {
-            firstVisibleUser.click();
+        let query = document.getElementById("searchInput").value.toLowerCase().trim();
+        if (!query) return;
+
+        // Ищем в массиве первого пользователя, чей ник содержит поисковый запрос и это не мы сами
+        let matchedUser = allUsersData.find(user => 
+            user.username !== myName && user.username.toLowerCase().includes(query)
+        );
+
+        if (matchedUser) {
+            // Находим его HTML элемент на странице, чтобы красиво подсветить синим цветом
+            let userElement = document.querySelector(`.user-item[data-username="${matchedUser.username}"]`);
+            selectUser(matchedUser.username, userElement);
+            
+            // Очищаем поиск, как в оригинальном Telegram
             document.getElementById("searchInput").value = "";
             filterUsers();
         }
@@ -176,7 +188,7 @@
         activeRecipient = username;
         document.getElementById("chatHeader").innerText = `Чат с: ${username}`;
         document.querySelectorAll('.user-item').forEach(el => el.classList.remove('active'));
-        element.classList.add('active');
+        if (element) element.classList.add('active');
         renderChat();
     }
 
