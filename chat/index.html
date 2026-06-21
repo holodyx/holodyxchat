@@ -24,6 +24,7 @@
         /* Список пользователей */
         .users-list-wrapper { flex: 1; overflow-y: auto; }
         .user-item { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #202b36; display: flex; align-items: center; justify-content: space-between; transition: 0.2s; }
+        .user-item * { pointer-events: none; } /* Важное исправление: клик не будет ломаться об внутренний текст */
         .user-item:hover { background: #24303f; }
         .user-item.active { background: #2b5278; }
         .user-item.hidden { display: none !important; }
@@ -47,7 +48,6 @@
     </style>
 </head>
 <body>
-
 <!-- Экран авторизации -->
 <div id="login-screen">
     <h2>Войти в Чат</h2>
@@ -55,12 +55,11 @@
     <button onclick="handleAuth()">Войти</button>
 </div>
 
-<!-- Главный экран -->
+<!-- Главный экран мессенджера -->
 <div id="chat-screen">
     <div class="sidebar">
         <div class="sidebar-header">Чаты</div>
         <div class="search-container">
-            <!-- СТРОКА ПОИСКА С ОБРАБОТКОЙ ENTER -->
             <input type="text" id="searchInput" class="search-input" placeholder="Поиск людей..." oninput="filterUsers()" onkeydown="if(event.key === 'Enter') selectFirstFoundUser()">
         </div>
         <div class="users-list-wrapper" id="usersList"></div>
@@ -74,7 +73,6 @@
         </div>
     </div>
 </div>
-
 <script>
     let ws;
     let myName = "";
@@ -137,11 +135,20 @@
             if (user.username !== myName) { 
                 let userBtn = document.createElement("div");
                 userBtn.classList.add("user-item");
+                userBtn.setAttribute("data-username", user.username);
                 if (user.username === activeRecipient) userBtn.classList.add("active");
+                
                 let onlineClass = user.is_online ? "online" : "";
                 let statusText = user.is_online ? "в сети" : "был(а) недавно";
+                
                 userBtn.innerHTML = `<div class="user-info"><strong>${user.username}</strong><span class="user-status-text ${onlineClass}">${statusText}</span></div><div class="status-dot ${onlineClass}"></div>`;
-                userBtn.onclick = () => selectUser(user.username, userBtn);
+                
+                // ИСПРАВЛЕНО: Безопасный клик, который точно сработает
+                userBtn.onclick = function(e) {
+                    let targetName = e.currentTarget.getAttribute("data-username");
+                    selectUser(targetName, e.currentTarget);
+                };
+                
                 listDiv.appendChild(userBtn);
             }
         });
@@ -151,12 +158,11 @@
     function filterUsers() {
         let query = document.getElementById("searchInput").value.toLowerCase().trim();
         document.querySelectorAll(".user-item").forEach(item => {
-            let username = item.querySelector("strong").innerText.toLowerCase();
+            let username = item.getAttribute("data-username").toLowerCase();
             item.classList.toggle("hidden", !username.includes(query));
         });
     }
 
-    // НОВАЯ ФУНКЦИЯ: Выбор контакта по нажатию Enter в поиске
     function selectFirstFoundUser() {
         let firstVisibleUser = document.querySelector(".user-item:not(.hidden)");
         if (firstVisibleUser) {
