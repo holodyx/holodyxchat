@@ -42,9 +42,9 @@ class ConnectionManager:
 
     async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
-        if username in self.active_connections:
-            try: await self.active_connections[username].close(code=4000)
-            except: pass
+        # Если ник пустой или сломался, не падаем
+        if not username:
+            username = "User_" + str(os.urandom(2).hex())
         self.active_connections[username] = websocket
         await self.broadcast_users_list()
 
@@ -57,7 +57,6 @@ class ConnectionManager:
         if not recipient:
             return
             
-        # Формируем правильный пакет для пересылки
         forward_packet = json.dumps({
             "type": "msg",
             "sender": sender,
@@ -67,10 +66,8 @@ class ConnectionManager:
             "fileName": packet_data.get("fileName", "")
         })
         
-        # Отправляем получателю
         if recipient in self.active_connections:
             await self.active_connections[recipient].send_text(forward_packet)
-        # Отправляем копию отправителю (кроме чата с самим собой, чтобы не дублировать)
         if sender in self.active_connections and sender != recipient:
             await self.active_connections[sender].send_text(forward_packet)
 
@@ -89,7 +86,7 @@ class ConnectionManager:
             })
         
         packet = json.dumps({"type": "users", "users": users_with_status})
-        for connection in self.active_connections.values():
+        for connection in list(self.active_connections.values()):
             try:
                 await connection.send_text(packet)
             except:
@@ -129,11 +126,9 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
         while True:
             data = await websocket.receive_text()
             try:
-                # Читаем прилетевший JSON-объект вместо обычного текста
                 message_data = json.loads(data)
                 await manager.route_message(username, message_data)
-            except json.JSONDecodeError:
-                # Если прилетел не JSON (на всякий случай)
+            except:
                 pass
     except WebSocketDisconnect:
         manager.disconnect(username, websocket)
