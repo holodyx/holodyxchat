@@ -52,21 +52,33 @@ class ConnectionManager:
         if username in self.active_connections and self.active_connections[username] == websocket:
             del self.active_connections[username]
             
-    async def send_private_message(self, sender: str, recipient: str, payload: dict):
-        #payload теперь содержит: text, time, msg_type (text/file/voice), file_data, file_name
-        payload["sender"] = sender
-        packet = json.dumps(payload)
+    async def route_message(self, sender: str, packet_data: dict):
+        recipient = packet_data.get("recipient")
+        if not recipient:
+            return
+            
+        # Формируем правильный пакет для пересылки
+        forward_packet = json.dumps({
+            "type": "msg",
+            "sender": sender,
+            "text": packet_data.get("text", ""),
+            "time": packet_data.get("time", ""),
+            "fileType": packet_data.get("fileType", "text"),
+            "fileName": packet_data.get("fileName", "")
+        })
         
+        # Отправляем получателю
         if recipient in self.active_connections:
-            await self.active_connections[recipient].send_text(packet)
-        if sender in self.active_connections:
-            await self.active_connections[sender].send_text(packet)
+            await self.active_connections[recipient].send_text(forward_packet)
+        # Отправляем копию отправителю (кроме чата с самим собой, чтобы не дублировать)
+        if sender in self.active_connections and sender != recipient:
+            await self.active_connections[sender].send_text(forward_packet)
 
     async def broadcast_users_list(self):
         conn = sqlite3.connect("chat.db")
         cursor = conn.cursor()
         cursor.execute("SELECT username FROM users")
-        all_registered = [row for row in cursor.fetchall()]
+        all_registered = [row[0] for row in cursor.fetchall()]
         conn.close()
 
         users_with_status = []
@@ -78,7 +90,10 @@ class ConnectionManager:
         
         packet = json.dumps({"type": "users", "users": users_with_status})
         for connection in self.active_connections.values():
-            await connection.send_text(packet)
+            try:
+                await connection.send_text(packet)
+            except:
+                pass
 
 manager = ConnectionManager()
 
@@ -102,7 +117,7 @@ async def auth_user(data: dict):
         return {"success": True}
     else:
         conn.close()
-        if row == user_token:
+        if row[0] == user_token:
             return {"success": True}
         else:
             return {"success": False, "error": "Этот никнейм уже занят другим устройством!"}
@@ -113,10 +128,13 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
     try:
         while True:
             data = await websocket.receive_text()
-            message_data = json.loads(data)
-            recipient = message_data.get("recipient")
-            if recipient:
-                await manager.send_private_message(username, recipient, message_data)
+            try:
+                # Читаем прилетевший JSON-объект вместо обычного текста
+                message_data = json.loads(data)
+                await manager.route_message(username, message_data)
+            except json.JSONDecodeError:
+                # Если прилетел не JSON (на всякий случай)
+                pass
     except WebSocketDisconnect:
         manager.disconnect(username, websocket)
         await manager.broadcast_users_list()
