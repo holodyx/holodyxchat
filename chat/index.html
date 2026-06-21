@@ -7,21 +7,18 @@
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
         body { background: #0e1621; display: flex; justify-content: center; align-items: center; height: 100vh; color: #fff; }
         
-        /* Экран входа */
         #login-screen { background: #17212b; padding: 30px; border-radius: 12px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 350px; }
         #login-screen h2 { margin-bottom: 20px; color: #5288c1; }
         input[type="text"] { width: 100%; padding: 12px; background: #24303f; border: 1px solid #2f3e4e; border-radius: 8px; color: white; outline: none; margin-bottom: 15px; font-size: 16px; }
         button { width: 100%; padding: 12px; background: #5288c1; border: none; border-radius: 8px; color: white; font-weight: bold; cursor: pointer; font-size: 16px; }
         button:hover { background: #4374a5; }
 
-        /* Главное окно мессенджера */
         #chat-screen { display: none; width: 800px; height: 85vh; background: #182533; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); overflow: hidden; }
         .sidebar { width: 250px; background: #17212b; border-right: 1px solid #101921; display: flex; flex-direction: column; }
         .sidebar-header { padding: 15px 15px 5px 15px; font-weight: bold; font-size: 16px; color: #5288c1; }
         .search-container { padding: 10px 15px; }
         .search-input { width: 100%; padding: 8px 12px; background: #24303f; border: none; border-radius: 6px; color: white; outline: none; font-size: 14px; }
 
-        /* Список пользователей */
         .users-list-wrapper { flex: 1; overflow-y: auto; }
         .user-item { padding: 12px 15px; cursor: pointer; border-bottom: 1px solid #202b36; display: flex; align-items: center; justify-content: space-between; transition: 0.2s; }
         .user-item * { pointer-events: none; }
@@ -29,14 +26,12 @@
         .user-item.active { background: #2b5278; }
         .user-item.hidden { display: none !important; }
 
-        /* Статусы Онлайн */
         .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #7f8c8d; }
         .status-dot.online { background: #4cae4f; box-shadow: 0 0 6px #4cae4f; }
         .user-info { display: flex; flex-direction: column; }
         .user-status-text { font-size: 11px; color: #7f8c8d; }
         .user-status-text.online { color: #4cae4f; }
 
-        /* Окно чата */
         .main-chat { flex: 1; display: flex; flex-direction: column; background: #0e1621; }
         .chat-header { background: #17212b; padding: 15px; font-weight: bold; border-bottom: 1px solid #101921; }
         .chat-window { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; background: url('https://githubusercontent.com'); background-color: #0e1621;}
@@ -48,19 +43,17 @@
     </style>
 </head>
 <body>
-<!-- Экран авторизации -->
 <div id="login-screen">
     <h2>Войти в Чат</h2>
     <input type="text" id="usernameInput" placeholder="Введите ваш ник..." onkeydown="if(event.key === 'Enter') handleAuth()">
     <button onclick="handleAuth()">Войти</button>
 </div>
 
-<!-- Главный экран мессенджера -->
 <div id="chat-screen">
     <div class="sidebar">
         <div class="sidebar-header">Чаты</div>
         <div class="search-container">
-            <input type="text" id="searchInput" class="search-input" placeholder="Поиск людей..." oninput="filterUsers()" onkeydown="if(event.key === 'Enter') selectFirstFoundUser()">
+            <input type="text" id="searchInput" class="search-input" placeholder="Поиск людей..." oninput="filterUsers()" onkeydown="if(event.key === 'Enter') handleSearchEnter()">
         </div>
         <div class="users-list-wrapper" id="usersList"></div>
     </div>
@@ -79,6 +72,7 @@
     let activeRecipient = ""; 
     let history = {}; 
     let allUsersData = [];
+    let localChatList = new Set(); // Храним список чатов, созданных локально через поиск
 
     function getDeviceToken() {
         let token = localStorage.getItem("chat_device_token");
@@ -131,26 +125,33 @@
     function updateUsersList() {
         let listDiv = document.getElementById("usersList");
         listDiv.innerHTML = "";
-        allUsersData.forEach(user => {
-            // Напоминание: твой собственный ник здесь скрывается, чтобы не писать самому себе.
-            if (user.username !== myName) { 
-                let userBtn = document.createElement("div");
-                userBtn.classList.add("user-item");
-                userBtn.setAttribute("data-username", user.username);
-                if (user.username === activeRecipient) userBtn.classList.add("active");
-                
-                let onlineClass = user.is_online ? "online" : "";
-                let statusText = user.is_online ? "в сети" : "был(а) недавно";
-                
-                userBtn.innerHTML = `<div class="user-info"><strong>${user.username}</strong><span class="user-status-text ${onlineClass}">${statusText}</span></div><div class="status-dot ${onlineClass}"></div>`;
-                
-                userBtn.onclick = function(e) {
-                    let targetName = e.currentTarget.getAttribute("data-username");
-                    selectUser(targetName, e.currentTarget);
-                };
-                
-                listDiv.appendChild(userBtn);
+        
+        // Создаем общий массив из пользователей сервера + тех, кого мы нашли вручную
+        let displayList = [...allUsersData];
+        localChatList.forEach(localUser => {
+            if (!displayList.some(u => u.username === localUser)) {
+                displayList.push({ username: localUser, is_online: false });
             }
+        });
+
+        displayList.forEach(user => {
+            // Разрешаем видеть и самого себя для тестов
+            let userBtn = document.createElement("div");
+            userBtn.classList.add("user-item");
+            userBtn.setAttribute("data-username", user.username);
+            if (user.username === activeRecipient) userBtn.classList.add("active");
+            
+            let onlineClass = user.is_online ? "online" : "";
+            let statusText = user.is_online ? "в сети" : "был(а) недавно";
+            
+            userBtn.innerHTML = `<div class="user-info"><strong>${user.username}</strong><span class="user-status-text ${onlineClass}">${statusText}</span></div><div class="status-dot ${onlineClass}"></div>`;
+            
+            userBtn.onclick = function(e) {
+                let targetName = e.currentTarget.getAttribute("data-username");
+                selectUser(targetName, e.currentTarget);
+            };
+            
+            listDiv.appendChild(userBtn);
         });
         filterUsers(); 
     }
@@ -163,32 +164,36 @@
         });
     }
 
-    // ИСПРАВЛЕННАЯ ФУНКЦИЯ: Работает напрямую через массив данных, а не через клики по экрану
-    function selectFirstFoundUser() {
-        let query = document.getElementById("searchInput").value.toLowerCase().trim();
+    // УМНЫЙ НАЖАТИЕ ENTER В ПОИСКЕ
+    function handleSearchEnter() {
+        let query = document.getElementById("searchInput").value.trim();
         if (!query) return;
 
-        // Ищем в массиве первого пользователя, чей ник содержит поисковый запрос и это не мы сами
-        let matchedUser = allUsersData.find(user => 
-            user.username !== myName && user.username.toLowerCase().includes(query)
-        );
-
-        if (matchedUser) {
-            // Находим его HTML элемент на странице, чтобы красиво подсветить синим цветом
-            let userElement = document.querySelector(`.user-item[data-username="${matchedUser.username}"]`);
-            selectUser(matchedUser.username, userElement);
+        // 1. Ищем, есть ли совпадение среди видимых на экране
+        let firstVisibleUser = document.querySelector(".user-item:not(.hidden)");
+        if (firstVisibleUser) {
+            firstVisibleUser.click();
+        } else {
+            // 2. Если совпадений нет — принудительно создаем новый чат с этим именем!
+            localChatList.add(query);
+            updateUsersList();
             
-            // Очищаем поиск, как в оригинальном Telegram
-            document.getElementById("searchInput").value = "";
-            filterUsers();
+            // Кликаем по свежесозданному пользователю
+            setTimeout(() => {
+                let newBtn = document.querySelector(`.user-item[data-username="${query}"]`);
+                if (newBtn) newBtn.click();
+            }, 50);
         }
+        
+        document.getElementById("searchInput").value = "";
+        filterUsers();
     }
 
     function selectUser(username, element) {
         activeRecipient = username;
         document.getElementById("chatHeader").innerText = `Чат с: ${username}`;
         document.querySelectorAll('.user-item').forEach(el => el.classList.remove('active'));
-        if (element) element.classList.add('active');
+        element.classList.add('active');
         renderChat();
     }
 
@@ -198,6 +203,12 @@
         if (!activeRecipient) { alert("Выберите собеседника!"); return; }
         if (text !== "" && ws) {
             ws.send(JSON.stringify({ recipient: activeRecipient, text: text }));
+            
+            // Если пишем сами себе — симулируем получение, чтобы увидеть сообщение
+            if (activeRecipient === myName) {
+                handleIncomingMessage(myName, text);
+            }
+            
             input.value = "";
         }
     }
@@ -205,6 +216,12 @@
     function handleIncomingMessage(sender, text) {
         let chatPartner = (sender === myName) ? activeRecipient : sender;
         if (!history[chatPartner]) history[chatPartner] = [];
+        
+        // Избегаем дубликатов при чате с самим собой
+        if (sender === myName && activeRecipient === myName && history[chatPartner].some(m => m.text === text && m.sender === myName)) {
+            return;
+        }
+        
         history[chatPartner].push({ sender: sender, text: text });
         if (chatPartner === activeRecipient) renderChat();
     }
