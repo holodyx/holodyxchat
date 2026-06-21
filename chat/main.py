@@ -30,10 +30,8 @@ def init_db():
 
 init_db()
 
-# НОВАЯ ФУНКЦИЯ: Сервер сам отдает файл index.html при заходе на сайт
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
-    # Ищем файл index.html в той же папочке, где лежит этот скрипт
     file_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -54,8 +52,11 @@ class ConnectionManager:
         if username in self.active_connections and self.active_connections[username] == websocket:
             del self.active_connections[username]
             
-    async def send_private_message(self, sender: str, recipient: str, text: str):
-        packet = json.dumps({"type": "msg", "sender": sender, "text": text})
+    async def send_private_message(self, sender: str, recipient: str, payload: dict):
+        #payload теперь содержит: text, time, msg_type (text/file/voice), file_data, file_name
+        payload["sender"] = sender
+        packet = json.dumps(payload)
+        
         if recipient in self.active_connections:
             await self.active_connections[recipient].send_text(packet)
         if sender in self.active_connections:
@@ -114,9 +115,8 @@ async def websocket_endpoint(websocket: WebSocket, username: str):
             data = await websocket.receive_text()
             message_data = json.loads(data)
             recipient = message_data.get("recipient")
-            text = message_data.get("text")
-            if recipient and text:
-                await manager.send_private_message(username, recipient, text)
+            if recipient:
+                await manager.send_private_message(username, recipient, message_data)
     except WebSocketDisconnect:
         manager.disconnect(username, websocket)
         await manager.broadcast_users_list()
