@@ -1,7 +1,6 @@
 """
-Holodyx Chat — всё в одном файле.
+Holodyx Chat v2 — звонки, поиск, минимализм.
 Запуск: python chat.py
-Открыть: http://127.0.0.1:5000
 """
 
 import os
@@ -9,7 +8,6 @@ import re
 import uuid
 import sqlite3
 import secrets
-from datetime import datetime
 from flask import Flask, request, jsonify, session, send_from_directory, Response
 from flask_socketio import SocketIO, emit, join_room
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -26,10 +24,10 @@ DB_PATH = os.path.join(BASE_DIR, 'chat.db')
 os.makedirs(AVATAR_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-MAX_MEDIA = 50 * 1024 * 1024  # 50 МБ
+MAX_MEDIA = 50 * 1024 * 1024
 
 # ============================================================
-# БАЗА ДАННЫХ
+# БД
 # ============================================================
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -64,6 +62,7 @@ def init_db():
             time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_room ON messages(room, id)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS reads (
             user_id INTEGER,
@@ -72,11 +71,18 @@ def init_db():
             PRIMARY KEY(user_id, room)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dialogs (
+            user_id INTEGER,
+            peer_name TEXT,
+            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id, peer_name)
+        )
+    """)
     conn.commit()
     conn.close()
 
 
-# ---------- USERS ----------
 def create_user(email, username, password):
     conn = db()
     try:
@@ -95,24 +101,30 @@ def create_user(email, username, password):
 
 
 def user_by_email(email):
-    conn = db()
-    r = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower(),)).fetchone()
-    conn.close()
+    conn = db(); r = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower(),)).fetchone(); conn.close()
     return dict(r) if r else None
 
 
 def user_by_username(username):
-    conn = db()
-    r = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    conn.close()
+    conn = db(); r = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone(); conn.close()
     return dict(r) if r else None
 
 
 def user_by_id(uid):
-    conn = db()
-    r = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    conn.close()
+    conn = db(); r = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone(); conn.close()
     return dict(r) if r else None
+
+
+def search_users(q, exclude_id, limit=20):
+    conn = db()
+    rows = conn.execute(
+        """SELECT id, username, avatar, bio FROM users
+           WHERE username LIKE ? AND id != ?
+           ORDER BY username LIMIT ?""",
+        (f'%{q}%', exclude_id, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def update_profile(uid, **fields):
@@ -120,10 +132,8 @@ def update_profile(uid, **fields):
     sets, vals = [], []
     for k, v in fields.items():
         if k in allowed:
-            sets.append(f"{k} = ?")
-            vals.append(v)
-    if not sets:
-        return True
+            sets.append(f"{k} = ?"); vals.append(v)
+    if not sets: return True
     vals.append(uid)
     conn = db()
     try:
@@ -136,7 +146,6 @@ def update_profile(uid, **fields):
         conn.close()
 
 
-# ---------- MESSAGES ----------
 def add_msg(room, sender_id, sender_name, type_, text='', media_url=None, media_name=None):
     conn = db()
     conn.execute(
@@ -166,8 +175,7 @@ def mark_read(uid, room, last_id):
         "INSERT INTO reads (user_id, room, last_read_id) VALUES (?, ?, ?) ON CONFLICT(user_id, room) DO UPDATE SET last_read_id = excluded.last_read_id",
         (uid, room, last_id)
     )
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 
 def reads_for_room(room):
@@ -177,16 +185,38 @@ def reads_for_room(room):
     return {r['user_id']: r['last_read_id'] for r in rows}
 
 
+def add_dialog(uid, peer_name):
+    conn = db()
+    conn.execute(
+        """INSERT INTO dialogs (user_id, peer_name, last_activity) VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(user_id, peer_name) DO UPDATE SET last_activity = CURRENT_TIMESTAMP""",
+        (uid, peer_name)
+    )
+    conn.commit(); conn.close()
+
+
+def list_dialogs(uid):
+    conn = db()
+    rows = conn.execute(
+        "SELECT peer_name FROM dialogs WHERE user_id = ? ORDER BY last_activity DESC LIMIT 100",
+        (uid,)
+    ).fetchall()
+    conn.close()
+    return [r['peer_name'] for r in rows]
+
+
 # ============================================================
-# FLASK APP
+# FLASK
 # ============================================================
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['MAX_CONTENT_LENGTH'] = MAX_MEDIA
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('HTTPS', '0') == '1'
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
+                    ping_timeout=60, ping_interval=25)
 
 online = {}
 name_to_sid = {}
@@ -226,7 +256,7 @@ def broadcast_online():
 
 
 # ============================================================
-# HTML (встроен)
+# HTML
 # ============================================================
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -237,120 +267,189 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0b0f17;--sidebar:#11161f;--chat-bg:#0e1420;--panel:#161c28;--panel-2:#1d2534;--accent:#4f8cff;--accent-2:#7c5cff;--text:#e6edf3;--muted:#7b879b;--border:#1f2734}
+:root{
+  --bg:#0d0f12; --panel:#14171c; --panel-2:#1a1e24; --hover:#1f242b;
+  --text:#e8eaed; --text-2:#8b929c; --text-3:#5f6772;
+  --border:#232830; --accent:#3b82f6; --accent-hover:#2563eb;
+  --danger:#ef4444; --success:#22c55e;
+  --own:#2b3542; --other:#1a1e24;
+}
 html,body{height:100%;overflow:hidden}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center}
-button,input,textarea{font-family:inherit}
-#auth{width:100%;max-width:440px;background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:34px;box-shadow:0 30px 80px rgba(0,0,0,.6);margin:20px}
-#auth h1{font-size:30px;text-align:center;margin-bottom:6px;background:linear-gradient(90deg,var(--accent),var(--accent-2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-#auth .sub{text-align:center;color:var(--muted);font-size:13px;margin-bottom:24px}
-#auth .tabs{display:flex;background:var(--panel-2);border-radius:12px;padding:4px;margin-bottom:18px}
-#auth .tabs button{flex:1;padding:9px;border:none;background:transparent;color:var(--muted);font-weight:600;cursor:pointer;border-radius:9px;font-size:14px}
-#auth .tabs button.active{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#fff}
-#auth input{width:100%;padding:13px 15px;margin-bottom:11px;background:var(--panel-2);border:1px solid var(--border);border-radius:12px;color:var(--text);font-size:15px;outline:none}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);font-size:14px;display:flex;align-items:center;justify-content:center}
+button,input,textarea{font-family:inherit;color:inherit}
+button{cursor:pointer;border:none;background:none}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2a3038;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#3a424c}
+
+/* AUTH */
+#auth{width:100%;max-width:380px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:32px;margin:20px}
+#auth h1{font-size:22px;font-weight:600;text-align:center;margin-bottom:4px}
+#auth .sub{text-align:center;color:var(--text-2);font-size:13px;margin-bottom:24px}
+#auth .tabs{display:flex;background:var(--panel-2);border-radius:8px;padding:3px;margin-bottom:16px}
+#auth .tabs button{flex:1;padding:8px;font-size:13px;font-weight:500;color:var(--text-2);border-radius:6px;transition:.15s}
+#auth .tabs button.active{background:var(--panel);color:var(--text)}
+#auth input{width:100%;padding:11px 13px;margin-bottom:10px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none;transition:.15s}
 #auth input:focus{border-color:var(--accent)}
-#auth .submit{width:100%;padding:13px;margin-top:6px;background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#fff;border:none;border-radius:12px;font-weight:600;font-size:15px;cursor:pointer}
-#auth .submit:disabled{opacity:.6;cursor:wait}
-#auth .err{color:#ff6b6b;font-size:13px;text-align:center;margin-top:10px;min-height:18px}
-#auth .ok{color:#2ecc71;font-size:13px;text-align:center;margin-top:10px;min-height:18px}
-#app{display:none;width:100vw;height:100vh;grid-template-columns:340px 1fr}
+#auth .submit{width:100%;padding:11px;background:var(--accent);border-radius:8px;font-weight:500;font-size:14px;transition:.15s}
+#auth .submit:hover{background:var(--accent-hover)}
+#auth .submit:disabled{opacity:.5;cursor:wait}
+#auth .err{color:var(--danger);font-size:13px;text-align:center;margin-top:10px;min-height:18px}
+#auth .ok{color:var(--success);font-size:13px;text-align:center;margin-top:10px;min-height:18px}
+
+/* APP */
+#app{display:none;width:100vw;height:100vh;grid-template-columns:300px 1fr}
 #app.active{display:grid}
-#sidebar{background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-#sidebarHeader{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px}
-.avatar-sm{width:42px;height:42px;border-radius:50%;overflow:hidden;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff}
+
+/* SIDEBAR */
+#sidebar{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+#sidebarHeader{padding:12px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.avatar-sm{width:36px;height:36px;border-radius:50%;flex-shrink:0;overflow:hidden;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:var(--text-2)}
 .avatar-sm img{width:100%;height:100%;object-fit:cover}
 #sidebarHeader .info{flex:1;min-width:0}
-#sidebarHeader .name{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#sidebarHeader .sub{font-size:12px;color:#2ecc71}
-#sidebarHeader button{background:transparent;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:6px;border-radius:8px}
-#sidebarHeader button:hover{background:rgba(255,255,255,.05);color:var(--text)}
-#search{padding:10px 14px;border-bottom:1px solid var(--border)}
-#search input{width:100%;padding:9px 12px;background:var(--panel-2);border:1px solid transparent;border-radius:10px;color:var(--text);font-size:14px;outline:none}
-#search input:focus{border-color:var(--accent)}
+#sidebarHeader .name{font-weight:500;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#sidebarHeader .sub{font-size:12px;color:var(--success)}
+.icon-btn{width:32px;height:32px;border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--text-2);transition:.15s}
+.icon-btn:hover{background:var(--hover);color:var(--text)}
+.icon-btn svg{width:18px;height:18px}
+#search{padding:8px 12px;border-bottom:1px solid var(--border)}
+#search input{width:100%;padding:8px 10px;background:var(--panel-2);border:1px solid transparent;border-radius:6px;font-size:13px;outline:none}
+#search input:focus{border-color:var(--border);background:var(--bg)}
 #chatList{flex:1;overflow-y:auto;padding:6px}
-.chat-item{display:flex;gap:12px;align-items:center;padding:10px 12px;border-radius:12px;cursor:pointer;position:relative}
-.chat-item:hover{background:rgba(255,255,255,.03)}
-.chat-item.active{background:linear-gradient(90deg,rgba(79,140,255,.15),rgba(124,92,255,.08))}
-.chat-item .avatar{width:46px;height:46px;border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff;flex-shrink:0;position:relative}
+.chat-item{display:flex;gap:10px;align-items:center;padding:9px 10px;border-radius:8px;cursor:pointer;position:relative;transition:background .12s}
+.chat-item:hover{background:var(--hover)}
+.chat-item.active{background:var(--hover)}
+.chat-item .avatar{width:40px;height:40px;border-radius:50%;flex-shrink:0;overflow:hidden;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px;color:var(--text-2);position:relative}
 .chat-item .avatar img{width:100%;height:100%;object-fit:cover}
-.chat-item .avatar.group{background:linear-gradient(135deg,var(--accent),var(--accent-2))}
-.chat-item .avatar .online-dot{position:absolute;bottom:0;right:0;width:12px;height:12px;border-radius:50%;background:#2ecc71;border:2px solid var(--sidebar)}
+.chat-item .avatar .online-dot{position:absolute;bottom:0;right:0;width:11px;height:11px;border-radius:50%;background:var(--success);border:2px solid var(--panel)}
 .chat-item .body{flex:1;min-width:0}
-.chat-item .row{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
-.chat-item .title{font-weight:600;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chat-item .time{font-size:11.5px;color:var(--muted);flex-shrink:0}
-.chat-item .preview{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
-.chat-item .badge{position:absolute;top:50%;transform:translateY(-50%);right:12px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px;display:none}
+.chat-item .row{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+.chat-item .title{font-weight:500;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-item .time{font-size:11px;color:var(--text-3);flex-shrink:0}
+.chat-item .preview{font-size:12.5px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+.chat-item .badge{position:absolute;top:50%;transform:translateY(-50%);right:10px;background:var(--accent);color:#fff;font-size:11px;font-weight:600;padding:2px 6px;border-radius:10px;display:none}
 .chat-item.unread .badge{display:block}
-#main{background:var(--chat-bg);display:flex;flex-direction:column;position:relative}
-#chatHeader{padding:10px 22px;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-shrink:0}
-#chatHeader .avatar{width:42px;height:42px;border-radius:50%;overflow:hidden;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff}
+
+/* MAIN */
+#main{background:var(--bg);display:flex;flex-direction:column;position:relative}
+#chatHeader{padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;min-height:56px}
+#chatHeader .avatar{width:36px;height:36px;border-radius:50%;overflow:hidden;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:var(--text-2);flex-shrink:0}
 #chatHeader .avatar img{width:100%;height:100%;object-fit:cover}
 #chatHeader .info{flex:1;min-width:0}
-#chatHeader .info .title{font-weight:600;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#chatHeader .info .sub{font-size:12.5px;color:var(--muted)}
-#chatHeader .info .sub.typing{color:var(--accent);font-style:italic}
-#messagesWrap{flex:1;overflow-y:auto;padding:22px 6% 12px;display:flex;flex-direction:column;gap:4px}
-#messagesWrap::-webkit-scrollbar{width:8px}
-#messagesWrap::-webkit-scrollbar-thumb{background:#232b38;border-radius:4px}
-.date-sep{align-self:center;font-size:12px;color:var(--muted);background:var(--panel);padding:4px 12px;border-radius:12px;margin:14px 0 8px}
-.bubble{max-width:65%;padding:8px 12px 6px;border-radius:14px;background:var(--panel-2);border:1px solid var(--border);font-size:14.5px;line-height:1.4;word-wrap:break-word;position:relative;margin-bottom:2px}
-.bubble .author{font-size:12px;font-weight:700;color:var(--accent);margin-bottom:2px}
+#chatHeader .info .title{font-weight:500;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#chatHeader .info .sub{font-size:12px;color:var(--text-2)}
+#chatHeader .info .sub.typing{color:var(--accent)}
+#chatHeader .actions{display:flex;gap:4px}
+
+#messagesWrap{flex:1;overflow-y:auto;padding:20px 8% 12px;display:flex;flex-direction:column;gap:2px}
+.date-sep{align-self:center;font-size:12px;color:var(--text-3);background:var(--panel);padding:3px 10px;border-radius:10px;margin:12px 0 8px}
+.bubble{max-width:60%;padding:8px 12px 6px;border-radius:12px;background:var(--other);border:1px solid var(--border);font-size:14px;line-height:1.4;word-wrap:break-word;margin-bottom:2px;align-self:flex-start}
+.bubble .author{font-size:12px;font-weight:600;color:var(--accent);margin-bottom:2px}
 .bubble .text{white-space:pre-wrap}
-.bubble .meta{display:flex;align-items:center;justify-content:flex-end;gap:4px;font-size:10.5px;color:var(--muted);margin-top:3px}
-.bubble .meta .check{color:#4f8cff;font-size:11px}
-.bubble.me{align-self:flex-end;background:linear-gradient(135deg,var(--accent),var(--accent-2));border:none;color:#fff;border-bottom-right-radius:4px}
+.bubble .meta{display:flex;align-items:center;justify-content:flex-end;gap:4px;font-size:10.5px;color:var(--text-3);margin-top:2px}
+.bubble .meta .check{color:var(--accent);font-size:11px}
+.bubble.me{align-self:flex-end;background:var(--own);border-color:#333d4c}
 .bubble.me .author{display:none}
-.bubble.me .meta{color:rgba(255,255,255,.75)}
-.bubble.me .meta .check{color:#fff}
-.bubble.other{border-bottom-left-radius:4px}
-.bubble img,.bubble video{max-width:100%;max-height:340px;border-radius:10px;display:block;margin-top:4px}
+.bubble.me .meta{color:var(--text-3)}
+.bubble img,.bubble video{max-width:100%;max-height:340px;border-radius:8px;display:block;margin-top:4px;cursor:pointer}
 .bubble audio{margin-top:6px;width:240px;max-width:100%}
-#inputBar{padding:12px 22px 18px;display:flex;gap:10px;align-items:flex-end;flex-shrink:0}
-#inputBar .inputWrap{flex:1;background:var(--panel-2);border:1px solid var(--border);border-radius:22px;display:flex;align-items:center;padding:4px 4px 4px 6px;transition:border-color .2s}
-#inputBar .inputWrap:focus-within{border-color:var(--accent)}
-#inputBar input[type=text]{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:15px;padding:10px 4px}
-.icon-btn{width:38px;height:38px;border-radius:50%;background:transparent;border:none;color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center}
-.icon-btn:hover{background:rgba(255,255,255,.06);color:var(--text)}
-.icon-btn svg{width:20px;height:20px}
-.icon-btn.recording{color:#ff6b6b;animation:pulse 1s infinite}
-@keyframes pulse{50%{opacity:.5}}
-#sendBtn{width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-#sendBtn:hover{filter:brightness(1.1);transform:scale(1.05)}
-#sendBtn svg{width:20px;height:20px}
-#empty{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;color:var(--muted);gap:10px}
-#empty svg{width:80px;height:80px;opacity:.3}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
+
+#inputBar{padding:10px 16px 16px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
+#inputBar .inputWrap{flex:1;background:var(--panel);border:1px solid var(--border);border-radius:10px;display:flex;align-items:center;padding:2px 2px 2px 4px;transition:.15s}
+#inputBar .inputWrap:focus-within{border-color:#333d4c}
+#inputBar input[type=text]{flex:1;background:transparent;border:none;outline:none;font-size:14px;padding:10px 8px}
+#inputBar .send-btn{width:40px;height:40px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;transition:.15s;flex-shrink:0}
+#inputBar .send-btn:hover{background:var(--accent-hover)}
+#inputBar .send-btn svg{width:18px;height:18px}
+.recording{color:var(--danger) !important}
+
+#empty{flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;color:var(--text-3);gap:12px;font-size:13px}
+#empty svg{width:56px;height:56px;opacity:.4}
+
+/* MODAL */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;z-index:100;padding:20px}
 .modal-overlay.visible{display:flex}
-.modal{background:var(--panel);border:1px solid var(--border);border-radius:16px;width:100%;max-width:480px;padding:26px;margin:20px;max-height:90vh;overflow-y:auto;box-shadow:0 30px 80px rgba(0,0,0,.7)}
-.modal h2{font-size:20px;margin-bottom:18px}
-.modal label{display:block;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:6px;margin-top:14px}
-.modal input[type=text],.modal textarea{width:100%;padding:11px 13px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14.5px;outline:none;resize:vertical}
-.modal textarea{min-height:80px}
-.modal .avatar-preview{width:96px;height:96px;border-radius:50%;overflow:hidden;margin:0 auto 12px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:32px;color:#fff;cursor:pointer;border:2px dashed transparent}
+.modal{background:var(--panel);border:1px solid var(--border);border-radius:12px;width:100%;max-width:440px;padding:22px;max-height:85vh;overflow-y:auto}
+.modal h2{font-size:17px;font-weight:600;margin-bottom:16px}
+.modal label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px;margin-top:14px}
+.modal input[type=text],.modal textarea{width:100%;padding:10px 12px;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none;resize:vertical}
+.modal input:focus,.modal textarea:focus{border-color:#333d4c}
+.modal textarea{min-height:70px}
+.modal .avatar-preview{width:80px;height:80px;border-radius:50%;overflow:hidden;margin:0 auto 10px;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:26px;color:var(--text-2);cursor:pointer;border:2px dashed var(--border);transition:.15s}
 .modal .avatar-preview:hover{border-color:var(--accent)}
 .modal .avatar-preview img{width:100%;height:100%;object-fit:cover}
-.modal .actions{display:flex;gap:10px;margin-top:22px}
-.modal .actions button{flex:1;padding:12px;border:none;border-radius:10px;font-weight:600;font-size:14.5px;cursor:pointer}
-.modal .actions .primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#fff}
-.modal .actions .secondary{background:var(--panel-2);color:var(--text);border:1px solid var(--border)}
-.modal .err{color:#ff6b6b;font-size:13px;margin-top:10px;min-height:16px}
-.modal .user-info-card{background:var(--panel-2);padding:14px;border-radius:12px;display:flex;gap:14px;align-items:center;margin-bottom:14px}
-.modal .user-info-card .avatar{width:64px;height:64px;border-radius:50%;overflow:hidden;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:22px;color:#fff}
-.modal .user-info-card .avatar img{width:100%;height:100%;object-fit:cover}
-.modal .user-info-card .info .name{font-weight:600;font-size:16px}
-.modal .user-info-card .info .bio{color:var(--muted);font-size:13px;margin-top:3px}
-#toast{position:fixed;bottom:20px;right:20px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:13px;opacity:0;transform:translateY(20px);transition:opacity .25s,transform .25s;pointer-events:none;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:300px;z-index:200}
-#toast.visible{opacity:1;transform:none}
-#backBtn{display:none;width:34px;height:34px;border-radius:50%;background:transparent;border:none;color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-@media (max-width:780px){#app{grid-template-columns:1fr}#sidebar{position:absolute;inset:0;z-index:5;transition:transform .25s}#sidebar.hidden{transform:translateX(-100%)}#main{position:absolute;inset:0;z-index:4}#backBtn{display:flex}}
+.modal .actions{display:flex;gap:8px;margin-top:18px}
+.modal .actions button{flex:1;padding:10px;border-radius:8px;font-weight:500;font-size:13.5px;transition:.15s}
+.modal .actions .primary{background:var(--accent)}
+.modal .actions .primary:hover{background:var(--accent-hover)}
+.modal .actions .secondary{background:var(--panel-2);border:1px solid var(--border)}
+.modal .actions .secondary:hover{background:var(--hover)}
+.modal .err{color:var(--danger);font-size:12.5px;margin-top:8px;min-height:14px}
+
+.user-result{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer;transition:.12s}
+.user-result:hover{background:var(--hover)}
+.user-result .avatar{width:36px;height:36px;border-radius:50%;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:var(--text-2);overflow:hidden;flex-shrink:0}
+.user-result .avatar img{width:100%;height:100%;object-fit:cover}
+.user-result .info .name{font-weight:500;font-size:13.5px}
+.user-result .info .bio{font-size:12px;color:var(--text-2);margin-top:1px}
+.user-result .status{width:8px;height:8px;border-radius:50%;background:#3a424c;flex-shrink:0}
+.user-result .status.online{background:var(--success)}
+
+/* CALL OVERLAY */
+#callScreen{position:fixed;inset:0;background:#000;z-index:200;display:none;flex-direction:column}
+#callScreen.active{display:flex}
+#callScreen .remoteVideo{flex:1;position:relative;overflow:hidden}
+#callScreen .remoteVideo video{width:100%;height:100%;object-fit:cover;background:#000}
+#callScreen .localVideo{position:absolute;bottom:16px;right:16px;width:180px;height:120px;border-radius:10px;overflow:hidden;border:2px solid #2a3038;background:#000;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+#callScreen .localVideo video{width:100%;height:100%;object-fit:cover}
+#callScreen .remoteVideo .placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;color:#8b929c}
+#callScreen .remoteVideo .placeholder .avatar{width:100px;height:100px;border-radius:50%;background:#2a3038;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:600;color:#e8eaed}
+#callScreen .remoteVideo .placeholder .name{font-size:18px;font-weight:500;color:#e8eaed}
+#callScreen .remoteVideo .placeholder .status{font-size:14px;color:#8b929c}
+#callScreen .controls{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);display:flex;gap:12px;z-index:10}
+#callScreen .controls button{width:52px;height:52px;border-radius:50%;background:rgba(255,255,255,.15);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(10px);transition:.15s}
+#callScreen .controls button:hover{background:rgba(255,255,255,.25)}
+#callScreen .controls button.danger{background:var(--danger)}
+#callScreen .controls button.danger:hover{background:#dc2626}
+#callScreen .controls button.active{background:#fff;color:#000}
+#callScreen .controls button svg{width:22px;height:22px}
+
+#incomingModal{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;z-index:300}
+#incomingModal.visible{display:flex}
+#incomingModal .box{background:var(--panel);border-radius:16px;padding:28px;text-align:center;min-width:280px}
+#incomingModal .avatar{width:80px;height:80px;border-radius:50%;margin:0 auto 14px;background:#2a3038;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:600;overflow:hidden}
+#incomingModal .avatar img{width:100%;height:100%;object-fit:cover}
+#incomingModal h3{font-size:16px;margin-bottom:4px}
+#incomingModal p{color:var(--text-2);font-size:13px;margin-bottom:20px}
+#incomingModal .btns{display:flex;gap:12px;justify-content:center}
+#incomingModal .btns button{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:.15s}
+#incomingModal .btns .accept{background:var(--success)}
+#incomingModal .btns .accept:hover{background:#16a34a}
+#incomingModal .btns .reject{background:var(--danger)}
+#incomingModal .btns .reject:hover{background:#dc2626}
+#incomingModal .btns svg{width:24px;height:24px;color:#fff}
+
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--panel);border:1px solid var(--border);padding:10px 16px;border-radius:8px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:400}
+#toast.visible{opacity:1;transform:translateX(-50%) translateY(0)}
+
+#backBtn{display:none}
+@media (max-width:780px){
+  #app{grid-template-columns:1fr}
+  #sidebar{position:absolute;inset:0;z-index:5;transition:transform .2s}
+  #sidebar.hidden{transform:translateX(-100%)}
+  #main{position:absolute;inset:0;z-index:4}
+  #backBtn{display:flex}
+  .bubble{max-width:80%}
+}
 </style>
 </head>
 <body>
 
+<!-- AUTH -->
 <div id="auth">
   <h1>Holodyx Chat</h1>
-  <div class="sub">Общайтесь, делитесь фото, видео и голосовыми</div>
+  <div class="sub">Общайтесь, звоните, делитесь медиа</div>
   <div class="tabs">
     <button id="tabLogin" class="active">Вход</button>
     <button id="tabRegister">Регистрация</button>
@@ -361,83 +460,173 @@ button,input,textarea{font-family:inherit}
     <button class="submit" id="loginBtn">Войти</button>
   </div>
   <div id="registerForm" style="display:none">
-    <input id="regEmail" type="email" placeholder="Email" autocomplete="email">
-    <input id="regUser" type="text" placeholder="Ник (3–20 символов)" autocomplete="username">
-    <input id="regPass" type="password" placeholder="Пароль (мин. 6)" autocomplete="new-password">
-    <input id="regPass2" type="password" placeholder="Повторите пароль" autocomplete="new-password">
+    <input id="regEmail" type="email" placeholder="Email">
+    <input id="regUser" type="text" placeholder="Ник (3–20 символов)">
+    <input id="regPass" type="password" placeholder="Пароль (мин. 6)">
+    <input id="regPass2" type="password" placeholder="Повторите пароль">
     <button class="submit" id="registerBtn">Зарегистрироваться</button>
   </div>
   <div class="err" id="authErr"></div>
   <div class="ok" id="authOk"></div>
 </div>
 
+<!-- APP -->
 <div id="app">
   <aside id="sidebar">
     <div id="sidebarHeader">
       <div class="avatar-sm" id="myAvatarSm">?</div>
       <div class="info">
         <div class="name" id="myNameSm">—</div>
-        <div class="sub">онлайн</div>
+        <div class="sub" id="myStatus">онлайн</div>
       </div>
-      <button id="settingsBtn" title="Настройки">⚙</button>
+      <button class="icon-btn" id="searchUsersBtn" title="Найти людей">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>
+      </button>
+      <button class="icon-btn" id="settingsBtn" title="Настройки">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
     </div>
-    <div id="search"><input id="searchInput" type="text" placeholder="Поиск..."></div>
+    <div id="search"><input id="searchInput" type="text" placeholder="Поиск по чатам..."></div>
     <div id="chatList"></div>
   </aside>
+
   <main id="main">
     <div id="empty">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-      <p>Выберите чат, чтобы начать общение</p>
+      <p>Выберите чат или найдите человека</p>
     </div>
+
     <div id="chatHeader" style="display:none">
-      <button id="backBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><path d="M15 18l-6-6 6-6"/></svg></button>
-      <div class="avatar" id="chatHeaderAvatar">?</div>
+      <button class="icon-btn" id="backBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <div class="avatar" id="chatHeaderAvatar"></div>
       <div class="info">
         <div class="title" id="chatHeaderTitle">—</div>
         <div class="sub" id="chatHeaderSub">—</div>
       </div>
-      <button class="icon-btn" id="peerInfoBtn" title="Профиль" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></button>
+      <div class="actions" id="callActions" style="display:none">
+        <button class="icon-btn" id="audioCallBtn" title="Аудиозвонок">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+        </button>
+        <button class="icon-btn" id="videoCallBtn" title="Видеозвонок">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        </button>
+      </div>
     </div>
+
     <div id="messagesWrap" style="display:none"></div>
+
     <div id="inputBar" style="display:none">
       <div class="inputWrap">
         <input type="file" id="fileInput" accept="image/*,video/*" style="display:none">
-        <button class="icon-btn" id="attachBtn" title="Фото / Видео"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
-        <button class="icon-btn" id="micBtn" title="Голосовое"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg></button>
-        <input id="msgInput" type="text" placeholder="Напишите сообщение..." maxlength="4000" autocomplete="off">
+        <button class="icon-btn" id="attachBtn" title="Фото или видео">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <button class="icon-btn" id="micBtn" title="Голосовое">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg>
+        </button>
+        <input id="msgInput" type="text" placeholder="Сообщение..." maxlength="4000" autocomplete="off">
       </div>
-      <button id="sendBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></button>
+      <button class="send-btn" id="sendBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+      </button>
     </div>
   </main>
 </div>
 
+<!-- SETTINGS MODAL -->
 <div class="modal-overlay" id="settingsModal">
   <div class="modal">
     <h2>Настройки профиля</h2>
     <input type="file" id="avatarInput" accept="image/*" style="display:none">
     <div class="avatar-preview" id="avatarPreview">?</div>
-    <label>Ник</label><input type="text" id="setUsername" maxlength="20">
-    <label>Описание профиля</label><textarea id="setBio" maxlength="300" placeholder="Расскажите о себе..."></textarea>
-    <label>Email</label><input type="text" id="setEmail" disabled>
+    <label>Ник</label>
+    <input type="text" id="setUsername" maxlength="20">
+    <label>О себе</label>
+    <textarea id="setBio" maxlength="300" placeholder="Пара слов о себе..."></textarea>
+    <label>Email</label>
+    <input type="text" id="setEmail" disabled style="opacity:.6">
     <div class="err" id="settingsErr"></div>
     <div class="actions">
       <button class="secondary" id="settingsCancel">Отмена</button>
       <button class="primary" id="settingsSave">Сохранить</button>
     </div>
-    <div class="actions" style="margin-top:8px">
-      <button class="secondary" id="logoutBtn" style="color:#ff6b6b">Выйти из аккаунта</button>
+    <div class="actions" style="margin-top:6px">
+      <button class="secondary" id="logoutBtn" style="color:var(--danger)">Выйти из аккаунта</button>
     </div>
   </div>
 </div>
 
+<!-- SEARCH USERS MODAL -->
+<div class="modal-overlay" id="searchUsersModal">
+  <div class="modal">
+    <h2>Найти человека</h2>
+    <input type="text" id="userSearchInput" placeholder="Введите ник..." autocomplete="off">
+    <div id="userSearchResults" style="margin-top:12px;max-height:400px;overflow-y:auto"></div>
+    <div class="actions">
+      <button class="secondary" id="searchUsersClose">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<!-- PEER INFO MODAL -->
 <div class="modal-overlay" id="peerModal">
   <div class="modal">
     <h2>Профиль</h2>
-    <div class="user-info-card">
-      <div class="avatar" id="peerAvatar">?</div>
-      <div class="info"><div class="name" id="peerName">—</div><div class="bio" id="peerBio">—</div></div>
+    <div style="display:flex;gap:14px;align-items:center;padding:12px;background:var(--panel-2);border-radius:8px">
+      <div class="avatar-sm" id="peerAvatar" style="width:60px;height:60px;font-size:20px"></div>
+      <div>
+        <div style="font-weight:600;font-size:15px" id="peerName">—</div>
+        <div style="color:var(--text-2);font-size:13px;margin-top:3px" id="peerBio">—</div>
+      </div>
     </div>
-    <div class="actions"><button class="secondary" id="peerClose" style="flex:1">Закрыть</button></div>
+    <div class="actions">
+      <button class="secondary" id="peerClose" style="flex:1">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<!-- INCOMING CALL -->
+<div id="incomingModal">
+  <div class="box">
+    <div class="avatar" id="incomingAvatar">?</div>
+    <h3 id="incomingName">—</h3>
+    <p id="incomingType">Входящий звонок</p>
+    <div class="btns">
+      <button class="reject" id="rejectCallBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 1L1 23M1 1l22 22"/></svg>
+      </button>
+      <button class="accept" id="acceptCallBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- CALL SCREEN -->
+<div id="callScreen">
+  <div class="remoteVideo">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <div class="placeholder" id="callPlaceholder">
+      <div class="avatar" id="callAvatar">?</div>
+      <div class="name" id="callName">—</div>
+      <div class="status" id="callStatus">Соединение...</div>
+    </div>
+  </div>
+  <div class="localVideo">
+    <video id="localVideo" autoplay muted playsinline></video>
+  </div>
+  <div class="controls">
+    <button id="muteBtn" title="Микрофон">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg>
+    </button>
+    <button id="camBtn" title="Камера">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+    </button>
+    <button class="danger" id="endCallBtn" title="Завершить">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 1L1 23M1 1l22 22"/></svg>
+    </button>
   </div>
 </div>
 
@@ -445,13 +634,14 @@ button,input,textarea{font-family:inherit}
 
 <script>
 const $ = id => document.getElementById(id);
-const socket = io({ autoConnect: false, transports: ['websocket', 'polling'] });
+const socket = io({ autoConnect: false });
 let me = null;
 const chats = {};
 let activeKey = null;
 const onlineUsers = new Map();
 const peerCache = {};
 
+/* ============ AUTH ============ */
 $('tabLogin').onclick = () => switchTab('login');
 $('tabRegister').onclick = () => switchTab('register');
 function switchTab(t) {
@@ -468,75 +658,80 @@ $('loginPass').addEventListener('keydown', e => e.key === 'Enter' && doLogin());
 async function doLogin() {
   const login = $('loginInput').value.trim();
   const password = $('loginPass').value;
-  $('authErr').textContent = '';
   if (!login || !password) { $('authErr').textContent = 'Заполните все поля'; return; }
   $('loginBtn').disabled = true;
   try {
     const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({login, password}) }).then(r => r.json());
-    if (!r.ok) { $('authErr').textContent = r.error || 'Ошибка входа'; return; }
+    if (!r.ok) { $('authErr').textContent = r.error || 'Ошибка'; return; }
     me = r.user; enterApp();
-  } catch (e) { $('authErr').textContent = 'Сеть: ' + e.message; }
+  } catch (e) { $('authErr').textContent = 'Ошибка сети'; }
   finally { $('loginBtn').disabled = false; }
 }
 $('registerBtn').onclick = doRegister;
-$('regPass2').addEventListener('keydown', e => e.key === 'Enter' && doRegister());
 async function doRegister() {
   const email = $('regEmail').value.trim();
   const username = $('regUser').value.trim();
   const p1 = $('regPass').value, p2 = $('regPass2').value;
   $('authErr').textContent = ''; $('authOk').textContent = '';
-  if (!email || !username || !p1) { $('authErr').textContent = 'Заполните все поля'; return; }
+  if (!email || !username || !p1) { $('authErr').textContent = 'Заполните поля'; return; }
   if (p1 !== p2) { $('authErr').textContent = 'Пароли не совпадают'; return; }
   if (p1.length < 6) { $('authErr').textContent = 'Пароль минимум 6 символов'; return; }
-  $('registerBtn').disabled = true; $('registerBtn').textContent = 'Регистрация...';
+  $('registerBtn').disabled = true; $('registerBtn').textContent = 'Создаём...';
   try {
     const r = await fetch('/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email, username, password: p1}) }).then(r => r.json());
-    if (!r.ok) { $('authErr').textContent = r.error || 'Ошибка регистрации'; return; }
-    $('authOk').textContent = '✅ Аккаунт создан! Входим...';
+    if (!r.ok) { $('authErr').textContent = r.error || 'Ошибка'; return; }
+    $('authOk').textContent = 'Аккаунт создан';
     $('loginInput').value = email; $('loginPass').value = p1;
     await doLogin();
-  } catch (e) { $('authErr').textContent = 'Сеть: ' + e.message; }
+  } catch (e) { $('authErr').textContent = 'Ошибка сети'; }
   finally { $('registerBtn').disabled = false; $('registerBtn').textContent = 'Зарегистрироваться'; }
 }
 (async () => {
   try {
     const r = await fetch('/api/me').then(r => r.json()).catch(() => ({ok:false}));
     if (r.ok) { me = r.user; enterApp(); }
-  } catch (e) {}
+  } catch(e) {}
 })();
 
+/* ============ ENTER APP ============ */
 function enterApp() {
-  $('auth').style.display = 'none'; $('app').classList.add('active');
+  $('auth').style.display = 'none';
+  $('app').classList.add('active');
   const av = $('myAvatarSm');
   av.innerHTML = me.avatar ? `<img src="${me.avatar}">` : initials(me.username);
-  av.style.background = me.avatar ? 'transparent' : colorFromName(me.username);
   $('myNameSm').textContent = me.username;
+
   chats['general'] = { key:'general', type:'general', title:'Общий чат', messages:[], unread:0, typing:false };
+
   if (!socket.connected) socket.connect();
 }
 
+/* ============ SOCKET ============ */
 socket.on('need_auth', () => socket.disconnect());
 socket.on('connect_error', e => console.warn('Socket:', e.message));
+
 socket.on('joined', data => {
   me = data.user;
   chats['general'].messages = data.history || [];
   data.online.forEach(u => {
     onlineUsers.set(u.id, u);
     peerCache[u.username.toLowerCase()] = u;
-    if (u.username.toLowerCase() !== me.username.toLowerCase()) ensureDM(u.username, u);
   });
+  // восстановить открытые диалоги
+  loadSavedDialogs();
   renderSidebar();
-  if (activeKey === 'general') { renderMessages(); scrollBottom(); }
 });
+
 socket.on('online', data => {
   onlineUsers.clear();
   data.users.forEach(u => {
     onlineUsers.set(u.id, u);
     peerCache[u.username.toLowerCase()] = u;
-    if (u.username.toLowerCase() !== me.username.toLowerCase()) ensureDM(u.username, u);
   });
-  renderSidebar(); updateHeaderSub();
+  renderSidebar();
+  if (activeKey && activeKey !== 'general') updateHeaderSub();
 });
+
 socket.on('message', msg => {
   const key = msg.room;
   let chat = chats[key];
@@ -544,8 +739,9 @@ socket.on('message', msg => {
     if (msg.room.startsWith('dm:')) {
       const parts = msg.room.slice(3).split('|');
       const peerName = parts.find(p => p !== me.username.toLowerCase());
-      const peer = peerCache[peerName] || {username: peerName, avatar: null};
+      const peer = peerCache[peerName] || {username: peerName};
       chat = ensureDM(peer.username, peer);
+      saveDialogs();
     } else return;
   }
   chat.messages.push(msg);
@@ -553,29 +749,29 @@ socket.on('message', msg => {
   const fromMe = msg.sender_id === me.id;
   if (!isActive && !fromMe && msg.type !== 'system') {
     chat.unread = (chat.unread || 0) + 1;
-    const who = chat.type === 'general' ? msg.sender_name : chat.title;
-    toastMsg(`💬 ${who}: ${preview(msg)}`);
   }
   if (isActive) {
     renderMessages(); scrollBottom();
     if (!fromMe && chat.messages.length) {
-      const lastId = chat.messages[chat.messages.length - 1].id;
-      socket.emit('read', { room: msg.room, last_id: lastId });
+      socket.emit('read', { room: msg.room, last_id: chat.messages[chat.messages.length-1].id });
     }
   }
   renderSidebar();
 });
+
 socket.on('typing', data => {
   const key = data.to === 'general' ? 'general' : dmKey(data.from, me.username);
   const chat = chats[key]; if (!chat) return;
   chat.typing = data.is_typing;
   if (activeKey === key) updateHeaderSub();
 });
+
 socket.on('read', data => {
   const chat = chats[data.room];
   if (chat) chat.reads = data.reads;
   if (activeKey === data.room) renderMessages();
 });
+
 socket.on('dm_history', data => {
   const key = data.room;
   let chat = chats[key];
@@ -587,23 +783,59 @@ socket.on('dm_history', data => {
   if (activeKey === key) { renderMessages(); scrollBottom(); }
 });
 
+/* ============ HELPERS ============ */
 function initials(n) { if (!n) return '?'; const p = n.trim().split(/\s+/); return (p.length === 1 ? p[0].slice(0,2) : p[0][0]+p[1][0]).toUpperCase(); }
-function colorFromName(n) { let h = 0; for (let i = 0; i < n.length; i++) h = (h*31 + n.charCodeAt(i)) % 360; return `linear-gradient(135deg,hsl(${h},65%,55%),hsl(${(h+40)%360},65%,45%))`; }
-function parseTime(iso) { if (!iso) return null; let s = String(iso); if (!s.includes('T')) s = s.replace(' ', 'T') + 'Z'; else if (!s.endsWith('Z') && !s.includes('+')) s += 'Z'; const d = new Date(s); return isNaN(d) ? null : d; }
+function parseTime(iso) {
+  if (!iso) return null;
+  let s = String(iso);
+  if (!s.includes('T')) s = s.replace(' ', 'T') + 'Z';
+  else if (!s.endsWith('Z') && !s.includes('+')) s += 'Z';
+  const d = new Date(s); return isNaN(d) ? null : d;
+}
 function fmtTime(iso) { const d = parseTime(iso); return d ? d.toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'}) : ''; }
-function fmtDate(iso) { const d = parseTime(iso); if (!d) return ''; const today = new Date(), yest = new Date(); yest.setDate(today.getDate()-1); const same = (a,b) => a.toDateString() === b.toDateString(); if (same(d, today)) return 'Сегодня'; if (same(d, yest)) return 'Вчера'; return d.toLocaleDateString('ru-RU', {day:'numeric', month:'long'}); }
+function fmtDate(iso) {
+  const d = parseTime(iso); if (!d) return '';
+  const today = new Date(), yest = new Date(); yest.setDate(today.getDate()-1);
+  const same = (a,b) => a.toDateString() === b.toDateString();
+  if (same(d, today)) return 'Сегодня';
+  if (same(d, yest)) return 'Вчера';
+  return d.toLocaleDateString('ru-RU', {day:'numeric', month:'long'});
+}
 function dmKey(a, b) { return 'dm:' + [a.toLowerCase(), b.toLowerCase()].sort().join('|'); }
 function ensureDM(peerName, peer) {
   const key = dmKey(me.username, peerName);
-  if (!chats[key]) chats[key] = { key, type:'dm', title: peerName, peer: peerName, avatar: peer.avatar || null, messages:[], unread:0, typing:false };
-  else if (peer.avatar) chats[key].avatar = peer.avatar;
+  if (!chats[key]) {
+    chats[key] = { key, type:'dm', title: peerName, peer: peerName, avatar: peer.avatar || null, messages:[], unread:0, typing:false };
+    saveDialogs();
+  } else if (peer.avatar) chats[key].avatar = peer.avatar;
   return chats[key];
 }
-function preview(m) { if (m.type === 'image') return '📷 Фото'; if (m.type === 'video') return '🎬 Видео'; if (m.type === 'audio') return '🎤 Голосовое'; return m.text || ''; }
+function preview(m) {
+  if (m.type === 'image') return '📷 Фото';
+  if (m.type === 'video') return '🎬 Видео';
+  if (m.type === 'audio') return '🎤 Голосовое';
+  return m.text || '';
+}
 function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function avatarHtml(user) { if (user.avatar) return `<img src="${user.avatar}" alt="">`; return initials(user.username || user); }
-function bgForAvatar(user) { return user.avatar ? 'transparent' : colorFromName(user.username || '?'); }
+function avatarHtml(u) { if (u.avatar) return `<img src="${u.avatar}">`; return initials(u.username || u); }
 
+/* ============ SAVE DIALOGS ============ */
+function saveDialogs() {
+  const list = Object.values(chats).filter(c => c.type === 'dm').map(c => c.peer);
+  try { localStorage.setItem('holodyx_dialogs', JSON.stringify(list)); } catch(e) {}
+}
+function loadSavedDialogs() {
+  try {
+    const list = JSON.parse(localStorage.getItem('holodyx_dialogs') || '[]');
+    list.forEach(peer => {
+      if (!peer) return;
+      const u = peerCache[peer.toLowerCase()] || {username: peer};
+      ensureDM(peer, u);
+    });
+  } catch(e) {}
+}
+
+/* ============ RENDER ============ */
 function renderSidebar() {
   const q = $('searchInput').value.trim().toLowerCase();
   const entries = Object.values(chats).filter(c => !q || c.title.toLowerCase().includes(q)).sort((a,b) => {
@@ -617,24 +849,21 @@ function renderSidebar() {
   entries.forEach(c => {
     const el = document.createElement('div');
     el.className = 'chat-item' + (c.key === activeKey ? ' active' : '') + (c.unread ? ' unread' : '');
-    const last = c.messages[c.messages.length - 1];
+    const last = c.messages[c.messages.length-1];
     let pv = 'Нет сообщений';
     if (last) {
       if (last.type === 'system') pv = last.text;
       else pv = (last.sender_id === me.id ? 'Вы: ' : (c.type==='general' ? last.sender_name+': ' : '')) + preview(last);
     }
-    const peerUser = c.type === 'dm' ? {username: c.peer, avatar: c.avatar} : {username: c.title, avatar: null};
+    const pu = c.type === 'dm' ? {username: c.peer, avatar: c.avatar} : {username: c.title, avatar: null};
     const online = c.type === 'dm' && [...onlineUsers.values()].some(u => u.username.toLowerCase() === (c.peer||'').toLowerCase());
     el.innerHTML = `
-      <div class="avatar ${c.type==='general'?'group':''}" style="background:${c.type==='general'?'':bgForAvatar(peerUser)}">
-        ${c.type === 'general' ? '💬' : avatarHtml(peerUser)}
-        ${online ? '<div class="online-dot"></div>' : ''}
-      </div>
+      <div class="avatar">${c.type==='general'?'💬':avatarHtml(pu)}${online?'<div class="online-dot"></div>':''}</div>
       <div class="body">
-        <div class="row"><div class="title">${escapeHtml(c.title)}</div><div class="time">${last ? fmtTime(last.time) : ''}</div></div>
+        <div class="row"><div class="title">${escapeHtml(c.title)}</div><div class="time">${last?fmtTime(last.time):''}</div></div>
         <div class="preview">${escapeHtml(pv)}</div>
       </div>
-      <div class="badge">${c.unread > 99 ? '99+' : c.unread}</div>
+      <div class="badge">${c.unread>99?'99+':c.unread}</div>
     `;
     el.onclick = () => openChat(c.key);
     $('chatList').appendChild(el);
@@ -648,16 +877,18 @@ function openChat(key) {
   $('chatHeader').style.display = 'flex';
   $('messagesWrap').style.display = 'flex';
   $('inputBar').style.display = 'flex';
-  const peerUser = c.type === 'dm' ? {username: c.peer, avatar: c.avatar} : {username: c.title, avatar: null};
-  $('chatHeaderAvatar').innerHTML = c.type === 'general' ? '💬' : avatarHtml(peerUser);
-  $('chatHeaderAvatar').style.background = c.type === 'general' ? 'linear-gradient(135deg,#4f8cff,#7c5cff)' : bgForAvatar(peerUser);
+  const pu = c.type === 'dm' ? {username: c.peer, avatar: c.avatar} : {username: c.title, avatar: null};
+  $('chatHeaderAvatar').innerHTML = c.type === 'general' ? '💬' : avatarHtml(pu);
   $('chatHeaderTitle').textContent = c.title;
+  $('callActions').style.display = c.type === 'dm' ? 'flex' : 'none';
   updateHeaderSub();
-  $('peerInfoBtn').style.display = c.type === 'dm' ? '' : 'none';
   $('sidebar').classList.add('hidden');
   renderMessages(); scrollBottom(); renderSidebar();
   if (c.type === 'dm') socket.emit('open_dm', { peer: c.peer });
-  else { const lastId = c.messages.length ? c.messages[c.messages.length-1].id : 0; if (lastId) socket.emit('read', { room: 'general', last_id: lastId }); }
+  else {
+    const lastId = c.messages.length ? c.messages[c.messages.length-1].id : 0;
+    if (lastId) socket.emit('read', { room: 'general', last_id: lastId });
+  }
   $('msgInput').focus();
 }
 $('backBtn').onclick = () => {
@@ -673,9 +904,12 @@ function updateHeaderSub() {
   const c = chats[activeKey]; if (!c) return;
   const sub = $('chatHeaderSub');
   sub.classList.remove('typing');
-  if (c.typing) { sub.textContent = 'печатает…'; sub.classList.add('typing'); return; }
+  if (c.typing) { sub.textContent = 'печатает...'; sub.classList.add('typing'); return; }
   if (c.type === 'general') sub.textContent = onlineUsers.size + ' онлайн';
-  else { const on = [...onlineUsers.values()].some(u => u.username.toLowerCase() === (c.peer||'').toLowerCase()); sub.textContent = on ? 'онлайн' : 'не в сети'; }
+  else {
+    const on = [...onlineUsers.values()].some(u => u.username.toLowerCase() === (c.peer||'').toLowerCase());
+    sub.textContent = on ? 'онлайн' : 'не в сети';
+  }
 }
 function renderMessages() {
   const c = chats[activeKey]; if (!c) return;
@@ -683,33 +917,30 @@ function renderMessages() {
   let lastDate = '';
   c.messages.forEach(m => {
     const d = fmtDate(m.time);
-    if (d && d !== lastDate) { const sep = document.createElement('div'); sep.className = 'date-sep'; sep.textContent = d; $('messagesWrap').appendChild(sep); lastDate = d; }
+    if (d && d !== lastDate) { const s = document.createElement('div'); s.className = 'date-sep'; s.textContent = d; $('messagesWrap').appendChild(s); lastDate = d; }
     if (m.type === 'system') { const s = document.createElement('div'); s.className = 'date-sep'; s.textContent = m.text; $('messagesWrap').appendChild(s); return; }
     const mine = m.sender_id === me.id;
     const el = document.createElement('div');
-    el.className = 'bubble ' + (mine ? 'me' : 'other');
+    el.className = 'bubble ' + (mine ? 'me' : '');
     const showAuthor = c.type === 'general' && !mine;
     let bodyHtml = '';
-    if (m.type === 'image') bodyHtml = `<img src="${m.media_url}" alt="" onclick="window.open('${m.media_url}','_blank')">`;
+    if (m.type === 'image') bodyHtml = `<img src="${m.media_url}" onclick="window.open('${m.media_url}','_blank')">`;
     else if (m.type === 'video') bodyHtml = `<video src="${m.media_url}" controls preload="metadata"></video>`;
     else if (m.type === 'audio') bodyHtml = `<audio src="${m.media_url}" controls preload="metadata"></audio>`;
     else bodyHtml = `<div class="text">${escapeHtml(m.text)}</div>`;
     let check = '';
     if (mine) {
-      const readBy = c.reads || {};
-      const others = Object.entries(readBy).filter(([uid]) => Number(uid) !== me.id);
-      const isRead = others.some(([_, lastId]) => Number(lastId) >= m.id);
-      check = isRead ? '✓✓' : '✓';
+      const rb = c.reads || {};
+      const others = Object.entries(rb).filter(([uid]) => Number(uid) !== me.id);
+      check = others.some(([_, lid]) => Number(lid) >= m.id) ? '✓✓' : '✓';
     }
-    el.innerHTML = `
-      ${showAuthor ? `<div class="author">${escapeHtml(m.sender_name)}</div>` : ''}
-      ${bodyHtml}
-      <div class="meta"><span>${fmtTime(m.time)}</span>${mine ? `<span class="check">${check}</span>` : ''}</div>
-    `;
+    el.innerHTML = `${showAuthor?`<div class="author">${escapeHtml(m.sender_name)}</div>`:''}${bodyHtml}<div class="meta"><span>${fmtTime(m.time)}</span>${mine?`<span class="check">${check}</span>`:''}</div>`;
     $('messagesWrap').appendChild(el);
   });
 }
 function scrollBottom() { requestAnimationFrame(() => { const w = $('messagesWrap'); w.scrollTop = w.scrollHeight; }); }
+
+/* ============ SEND ============ */
 function currentRoom() { const c = chats[activeKey]; if (!c) return null; return c.type === 'general' ? 'general' : dmKey(me.username, c.peer); }
 function send() {
   const text = $('msgInput').value.trim();
@@ -731,6 +962,8 @@ $('msgInput').addEventListener('input', () => {
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => socket.emit('typing', { is_typing: false, to }), 1200);
 });
+
+/* ============ MEDIA UPLOAD ============ */
 $('attachBtn').onclick = () => $('fileInput').click();
 $('fileInput').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
@@ -745,9 +978,11 @@ async function uploadFile(file, kind, room) {
   fd.append('file', file); fd.append('kind', kind); fd.append('room', room);
   try {
     const r = await fetch('/api/upload', { method:'POST', body: fd }).then(r => r.json());
-    if (!r.ok) toastMsg('⚠ ' + (r.error||'Ошибка загрузки'));
-  } catch (e) { toastMsg('⚠ Сеть: ' + e.message); }
+    if (!r.ok) toast(r.error || 'Ошибка загрузки');
+  } catch(e) { toast('Ошибка сети'); }
 }
+
+/* ============ VOICE ============ */
 let mediaRecorder = null, recordedChunks = [], recStart = 0, recTimer = null;
 $('micBtn').onclick = async () => {
   if (mediaRecorder && mediaRecorder.state === 'recording') { mediaRecorder.stop(); return; }
@@ -761,10 +996,10 @@ $('micBtn').onclick = async () => {
     mediaRecorder.onstop = async () => {
       clearInterval(recTimer);
       $('micBtn').classList.remove('recording');
-      $('msgInput').placeholder = 'Напишите сообщение...';
+      $('msgInput').placeholder = 'Сообщение...';
       const duration = Math.round((Date.now() - recStart) / 1000);
       stream.getTracks().forEach(t => t.stop());
-      if (duration < 1) { toastMsg('Слишком короткая запись'); return; }
+      if (duration < 1) { toast('Слишком коротко'); return; }
       const type = mediaRecorder.mimeType || 'audio/webm';
       const blob = new Blob(recordedChunks, { type });
       const ext = type.includes('ogg') ? 'ogg' : 'webm';
@@ -775,18 +1010,23 @@ $('micBtn').onclick = async () => {
     mediaRecorder.start();
     $('micBtn').classList.add('recording');
     let sec = 0;
-    $('msgInput').placeholder = '⏺ Идёт запись... 0:00';
-    recTimer = setInterval(() => { sec++; $('msgInput').placeholder = `⏺ Идёт запись... ${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`; }, 1000);
-  } catch (err) { toastMsg('Нет доступа к микрофону'); }
+    $('msgInput').placeholder = '⏺ 0:00';
+    recTimer = setInterval(() => { sec++; $('msgInput').placeholder = `⏺ ${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`; }, 1000);
+  } catch(e) { toast('Нет доступа к микрофону'); }
 };
-function getAudioMime() { const list = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']; for (const m of list) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m; return ''; }
+function getAudioMime() {
+  const list = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+  for (const m of list) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  return '';
+}
+
+/* ============ SETTINGS ============ */
 $('settingsBtn').onclick = () => {
   $('setUsername').value = me.username || '';
   $('setBio').value = me.bio || '';
   $('setEmail').value = me.email || '';
   const prev = $('avatarPreview');
   prev.innerHTML = me.avatar ? `<img src="${me.avatar}">` : initials(me.username);
-  prev.style.background = me.avatar ? 'transparent' : colorFromName(me.username);
   $('settingsErr').textContent = '';
   $('settingsModal').classList.add('visible');
 };
@@ -794,9 +1034,7 @@ $('settingsCancel').onclick = () => $('settingsModal').classList.remove('visible
 $('avatarPreview').onclick = () => $('avatarInput').click();
 $('avatarInput').onchange = e => {
   const f = e.target.files[0]; if (!f) return;
-  const url = URL.createObjectURL(f);
-  $('avatarPreview').innerHTML = `<img src="${url}">`;
-  $('avatarPreview').style.background = 'transparent';
+  $('avatarPreview').innerHTML = `<img src="${URL.createObjectURL(f)}">`;
 };
 $('settingsSave').onclick = async () => {
   const fd = new FormData();
@@ -810,26 +1048,307 @@ $('settingsSave').onclick = async () => {
     me = r.user;
     const av = $('myAvatarSm');
     av.innerHTML = me.avatar ? `<img src="${me.avatar}">` : initials(me.username);
-    av.style.background = me.avatar ? 'transparent' : colorFromName(me.username);
     $('myNameSm').textContent = me.username;
     $('settingsModal').classList.remove('visible');
-    toastMsg('✅ Профиль обновлён');
-  } catch (e) { $('settingsErr').textContent = 'Сеть: ' + e.message; }
+    toast('Профиль обновлён');
+  } catch(e) { $('settingsErr').textContent = 'Ошибка сети'; }
 };
 $('logoutBtn').onclick = async () => { await fetch('/api/logout', { method:'POST' }); location.reload(); };
-$('peerInfoBtn').onclick = () => {
+
+/* ============ SEARCH USERS ============ */
+$('searchUsersBtn').onclick = () => {
+  $('searchUsersModal').classList.add('visible');
+  $('userSearchInput').value = '';
+  $('userSearchResults').innerHTML = '';
+  setTimeout(() => $('userSearchInput').focus(), 100);
+};
+$('searchUsersClose').onclick = () => $('searchUsersModal').classList.remove('visible');
+let searchTimer = null;
+$('userSearchInput').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(searchUsers, 250);
+});
+async function searchUsers() {
+  const q = $('userSearchInput').value.trim();
+  if (!q) { $('userSearchResults').innerHTML = ''; return; }
+  try {
+    const r = await fetch(`/api/users/search?q=${encodeURIComponent(q)}`).then(r => r.json());
+    if (!r.ok) return;
+    const box = $('userSearchResults');
+    box.innerHTML = '';
+    if (!r.users.length) {
+      box.innerHTML = '<div style="color:var(--text-3);text-align:center;padding:20px;font-size:13px">Никого не найдено</div>';
+      return;
+    }
+    r.users.forEach(u => {
+      const online = [...onlineUsers.values()].some(x => x.id === u.id);
+      const el = document.createElement('div');
+      el.className = 'user-result';
+      el.innerHTML = `
+        <div class="avatar">${u.avatar ? `<img src="${u.avatar}">` : initials(u.username)}</div>
+        <div class="info" style="flex:1;min-width:0">
+          <div class="name">${escapeHtml(u.username)}</div>
+          <div class="bio">${escapeHtml(u.bio || 'Без описания')}</div>
+        </div>
+        <div class="status ${online?'online':''}"></div>
+      `;
+      el.onclick = () => {
+        peerCache[u.username.toLowerCase()] = u;
+        ensureDM(u.username, u);
+        $('searchUsersModal').classList.remove('visible');
+        openChat(dmKey(me.username, u.username));
+      };
+      box.appendChild(el);
+    });
+  } catch(e) {}
+}
+
+/* ============ PEER INFO ============ */
+$('chatHeader').addEventListener('contextmenu', e => e.preventDefault());
+document.querySelector('#chatHeader .avatar').onclick = () => {
   const c = chats[activeKey]; if (!c || c.type !== 'dm') return;
   const u = peerCache[c.peer.toLowerCase()] || {username: c.peer, avatar: c.avatar, bio: ''};
   $('peerAvatar').innerHTML = u.avatar ? `<img src="${u.avatar}">` : initials(u.username);
-  $('peerAvatar').style.background = u.avatar ? 'transparent' : colorFromName(u.username);
   $('peerName').textContent = u.username;
-  $('peerBio').textContent = u.bio || 'Нет описания';
+  $('peerBio').textContent = u.bio || 'Без описания';
   $('peerModal').classList.add('visible');
 };
 $('peerClose').onclick = () => $('peerModal').classList.remove('visible');
+
+/* ============ TOAST ============ */
+function toast(t) {
+  const el = $('toast'); el.textContent = t; el.classList.add('visible');
+  clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('visible'), 2200);
+}
+
+/* ============ SEARCH CHATS ============ */
 $('searchInput').addEventListener('input', renderSidebar);
-function toastMsg(t) { const el = $('toast'); el.textContent = t; el.classList.add('visible'); clearTimeout(toastMsg._t); toastMsg._t = setTimeout(() => el.classList.remove('visible'), 2500); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { $('settingsModal').classList.remove('visible'); $('peerModal').classList.remove('visible'); } });
+
+/* ============ ESC ============ */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal-overlay.visible').forEach(m => m.classList.remove('visible'));
+  }
+});
+
+/* ============================================================
+   WEBRTC ЗВОНКИ
+============================================================ */
+let pc = null;
+let localStream = null;
+let currentCallPeer = null;
+let currentCallType = null; // 'audio' | 'video'
+let isCaller = false;
+let pendingCandidates = [];
+let callTimeout = null;
+
+const rtcConfig = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
+
+function showCallScreen(peerName, type) {
+  currentCallPeer = peerName;
+  currentCallType = type;
+  $('callName').textContent = peerName;
+  $('callStatus').textContent = type === 'video' ? 'Видеозвонок' : 'Аудиозвонок';
+  const u = peerCache[peerName.toLowerCase()] || {username: peerName};
+  $('callAvatar').innerHTML = u.avatar ? `<img src="${u.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover">` : initials(peerName);
+  $('callScreen').classList.add('active');
+  $('callPlaceholder').style.display = 'flex';
+  $('camBtn').style.display = type === 'video' ? 'flex' : 'none';
+}
+
+function hideCallScreen() {
+  $('callScreen').classList.remove('active');
+  $('remoteVideo').srcObject = null;
+  $('localVideo').srcObject = null;
+  if (callTimeout) { clearTimeout(callTimeout); callTimeout = null; }
+}
+
+async function startCall(type) {
+  const c = chats[activeKey]; if (!c || c.type !== 'dm') return;
+  isCaller = true;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: type === 'video'
+    });
+    $('localVideo').srcObject = localStream;
+    showCallScreen(c.peer, type);
+    $('callStatus').textContent = 'Вызов...';
+
+    pc = new RTCPeerConnection(rtcConfig);
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    setupPcHandlers();
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('call_offer', { to: c.peer, offer, type });
+
+    // автоотмена если не ответили за 30 сек
+    callTimeout = setTimeout(() => {
+      toast('Нет ответа');
+      endCall(true);
+    }, 30000);
+  } catch(e) {
+    toast('Нет доступа к микрофону/камере');
+    hideCallScreen();
+  }
+}
+
+function setupPcHandlers() {
+  pc.ontrack = e => {
+    $('remoteVideo').srcObject = e.streams[0];
+    $('callPlaceholder').style.display = 'none';
+    $('callStatus').textContent = 'Соединено';
+    if (callTimeout) { clearTimeout(callTimeout); callTimeout = null; }
+  };
+  pc.onicecandidate = e => {
+    if (e.candidate) {
+      socket.emit('call_ice', { to: currentCallPeer, candidate: e.candidate });
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (['failed','disconnected','closed'].includes(pc.connectionState)) {
+      if ($('callScreen').classList.contains('active')) endCall(true);
+    }
+  };
+}
+
+$('audioCallBtn').onclick = () => startCall('audio');
+$('videoCallBtn').onclick = () => startCall('video');
+
+function endCall(silent) {
+  if (currentCallPeer && !silent) {
+    socket.emit('call_end', { to: currentCallPeer });
+  } else if (currentCallPeer) {
+    socket.emit('call_end', { to: currentCallPeer });
+  }
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  if (pc) { try { pc.close(); } catch(e){} pc = null; }
+  currentCallPeer = null;
+  currentCallType = null;
+  isCaller = false;
+  pendingCandidates = [];
+  hideCallScreen();
+}
+$('endCallBtn').onclick = () => endCall(false);
+
+// Mute / Camera toggle
+let micEnabled = true, camEnabled = true;
+$('muteBtn').onclick = () => {
+  if (!localStream) return;
+  micEnabled = !micEnabled;
+  localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  $('muteBtn').classList.toggle('active', !micEnabled);
+};
+$('camBtn').onclick = () => {
+  if (!localStream) return;
+  camEnabled = !camEnabled;
+  localStream.getVideoTracks().forEach(t => t.enabled = camEnabled);
+  $('camBtn').classList.toggle('active', !camEnabled);
+};
+
+/* --- Socket сигналинг --- */
+socket.on('call_offer', async data => {
+  if (pc) { // заняты
+    socket.emit('call_reject', { to: data.from, reason: 'busy' });
+    return;
+  }
+  isCaller = false;
+  pendingCandidates = [];
+  const u = peerCache[data.from.toLowerCase()] || {username: data.from};
+  $('incomingAvatar').innerHTML = u.avatar ? `<img src="${u.avatar}">` : initials(data.from);
+  $('incomingName').textContent = data.from;
+  $('incomingType').textContent = data.type === 'video' ? 'Входящий видеозвонок' : 'Входящий звонок';
+  $('incomingModal').classList.add('visible');
+  $('incomingModal').dataset.offer = JSON.stringify(data.offer);
+  $('incomingModal').dataset.from = data.from;
+  $('incomingModal').dataset.type = data.type;
+});
+
+$('acceptCallBtn').onclick = async () => {
+  const offer = JSON.parse($('incomingModal').dataset.offer);
+  const from = $('incomingModal').dataset.from;
+  const type = $('incomingModal').dataset.type;
+  $('incomingModal').classList.remove('visible');
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: type === 'video'
+    });
+    $('localVideo').srcObject = localStream;
+    currentCallPeer = from;
+    currentCallType = type;
+    showCallScreen(from, type);
+    $('callStatus').textContent = 'Соединение...';
+
+    pc = new RTCPeerConnection(rtcConfig);
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    setupPcHandlers();
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // отправить накопленные ICE
+    for (const c of pendingCandidates) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+    }
+    pendingCandidates = [];
+
+    socket.emit('call_answer', { to: from, answer });
+  } catch(e) {
+    toast('Не удалось принять звонок');
+    socket.emit('call_reject', { to: from });
+    hideCallScreen();
+  }
+};
+
+$('rejectCallBtn').onclick = () => {
+  const from = $('incomingModal').dataset.from;
+  socket.emit('call_reject', { to: from });
+  $('incomingModal').classList.remove('visible');
+};
+
+socket.on('call_answer', async data => {
+  if (!pc) return;
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+    for (const c of pendingCandidates) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
+    }
+    pendingCandidates = [];
+    $('callStatus').textContent = 'Соединение...';
+  } catch(e) { console.error(e); }
+});
+
+socket.on('call_ice', async data => {
+  if (!pc) return;
+  const cand = data.candidate;
+  if (pc.remoteDescription && pc.remoteDescription.type) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(cand)); } catch(e){}
+  } else {
+    pendingCandidates.push(cand);
+  }
+});
+
+socket.on('call_reject', data => {
+  toast(data.reason === 'busy' ? 'Абонент занят' : 'Звонок отклонён');
+  endCall(true);
+});
+
+socket.on('call_end', data => {
+  if (currentCallPeer && data.from === currentCallPeer) {
+    toast('Звонок завершён');
+    endCall(true);
+  }
+});
+
 </script>
 </body>
 </html>
@@ -875,17 +1394,16 @@ def api_register():
         if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
             return jsonify(ok=False, error='Некорректный email'), 400
         if not re.match(r'^[A-Za-zА-Яа-я0-9_]{3,20}$', username):
-            return jsonify(ok=False, error='Ник: 3–20 символов (буквы, цифры, _)'), 400
+            return jsonify(ok=False, error='Ник: 3–20 символов'), 400
         if len(password) < 6:
             return jsonify(ok=False, error='Пароль минимум 6 символов'), 400
         if user_by_email(email):
-            return jsonify(ok=False, error='Email уже занят'), 400
+            return jsonify(ok=False, error='Email занят'), 400
         if user_by_username(username):
-            return jsonify(ok=False, error='Ник уже занят'), 400
+            return jsonify(ok=False, error='Ник занят'), 400
         uid = create_user(email, username, password)
         if not uid:
-            return jsonify(ok=False, error='Не удалось создать'), 500
-        print(f"[REGISTER] OK uid={uid}")
+            return jsonify(ok=False, error='Ошибка создания'), 500
         return jsonify(ok=True, uid=uid)
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -897,9 +1415,7 @@ def api_login():
     data = request.get_json(silent=True) or {}
     login = (data.get('login') or '').strip()
     password = data.get('password') or ''
-    user = None
-    if '@' in login:
-        user = user_by_email(login)
+    user = user_by_email(login) if '@' in login else None
     if not user:
         user = user_by_username(login)
     if not user or not check_password_hash(user['password_hash'], password):
@@ -933,6 +1449,26 @@ def api_logout():
     return jsonify(ok=True)
 
 
+@app.route('/api/users/search')
+def api_users_search():
+    uid = session.get('uid')
+    if not uid:
+        return jsonify(ok=False), 401
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 1:
+        return jsonify(ok=True, users=[])
+    users = search_users(q, uid, 20)
+    return jsonify(ok=True, users=users)
+
+
+@app.route('/api/dialogs')
+def api_dialogs():
+    uid = session.get('uid')
+    if not uid:
+        return jsonify(ok=False), 401
+    return jsonify(ok=True, dialogs=list_dialogs(uid))
+
+
 @app.route('/api/profile', methods=['POST'])
 def api_profile():
     uid = session.get('uid')
@@ -955,7 +1491,7 @@ def api_profile():
     file = request.files.get('avatar')
     if file and file.filename:
         if ext_of(file.filename) not in ALLOWED_AVATAR:
-            return jsonify(ok=False, error='Формат аватара не поддерживается'), 400
+            return jsonify(ok=False, error='Формат не поддерживается'), 400
         fn = f"{uuid.uuid4().hex}.{ext_of(file.filename)}"
         file.save(os.path.join(AVATAR_DIR, fn))
         updates['avatar'] = f"/chat_uploads/avatars/{fn}"
@@ -970,6 +1506,8 @@ def api_profile():
 
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
+    """ВАЖНО: не рассылаем через socketio.emit — только возвращаем результат.
+    Фронт сам эмитит через 'send_media', чтобы избежать дубликата."""
     uid = session.get('uid')
     if not uid:
         return jsonify(ok=False, error='Не авторизован'), 401
@@ -1000,11 +1538,18 @@ def api_upload():
     msg = add_msg(room=room, sender_id=u['id'], sender_name=u['username'],
                   type_=msg_type, text='', media_url=url, media_name=file.filename)
     payload = serialize(msg)
-    socketio.emit('message', payload, to=room)
-    if room.startswith('dm:'):
-        for name in room[3:].split('|'):
+    # отправляем только отправителю (он покажет локально)
+    # и собеседникам через комнату, но НЕ дублируем отправителю
+    if room == 'general':
+        socketio.emit('message', payload, to='general', include_self=False)
+        socketio.emit('message', payload, to=request.sid)
+    else:
+        # личные: отправителю + получателю
+        socketio.emit('message', payload, to=request.sid)
+        parts = room[3:].split('|')
+        for name in parts:
             sid = name_to_sid.get(name)
-            if sid:
+            if sid and sid != request.sid:
                 socketio.emit('message', payload, to=sid)
     return jsonify(ok=True, message=payload)
 
@@ -1020,16 +1565,19 @@ def on_connect():
     u = user_by_id(uid)
     if not u:
         emit('need_auth'); return
-    online[request.sid] = {'id': u['id'], 'username': u['username'], 'avatar': u['avatar'], 'bio': u['bio']}
+    online[request.sid] = {'id': u['id'], 'username': u['username'],
+                            'avatar': u['avatar'], 'bio': u['bio']}
     name_to_sid[u['username'].lower()] = request.sid
     join_room('general')
     join_room(f"user:{u['id']}")
     emit('joined', {
-        'user': {'id': u['id'], 'username': u['username'], 'avatar': u['avatar'], 'bio': u['bio'], 'email': u['email']},
+        'user': {'id': u['id'], 'username': u['username'],
+                 'avatar': u['avatar'], 'bio': u['bio'], 'email': u['email']},
         'history': history('general', 200),
         'online': online_list(),
     })
-    sys_msg = add_msg('general', None, u['username'], 'system', text=f"{u['username']} присоединился к чату")
+    sys_msg = add_msg('general', None, u['username'], 'system',
+                      text=f"{u['username']} присоединился к чату")
     emit('message', serialize(sys_msg), to='general')
     broadcast_online()
 
@@ -1041,6 +1589,7 @@ def on_open_dm(data):
     me_user = user_by_id(uid)
     peer = (data.get('peer') or '').strip()
     if not peer: return
+    add_dialog(me_user['id'], peer)
     room = dm_room(me_user['username'], peer)
     join_room(room)
     emit('dm_history', {'room': room, 'peer': peer, 'history': history(room, 200)})
@@ -1056,14 +1605,17 @@ def on_send(data):
     to = (data.get('to') or 'general').strip()
     if not text: return
     room = 'general' if to == 'general' else dm_room(me_user['username'], to)
-    msg = add_msg(room=room, sender_id=me_user['id'], sender_name=me_user['username'], type_='text', text=text)
+    msg = add_msg(room=room, sender_id=me_user['id'],
+                  sender_name=me_user['username'], type_='text', text=text)
     payload = serialize(msg)
     if room == 'general':
         emit('message', payload, to='general')
     else:
+        add_dialog(me_user['id'], to)
         emit('message', payload)
         sid = name_to_sid.get(to.lower())
-        if sid: emit('message', payload, to=sid)
+        if sid:
+            emit('message', payload, to=sid)
 
 
 @socketio.on('typing')
@@ -1075,7 +1627,8 @@ def on_typing(data):
     to = (data.get('to') or 'general').strip()
     is_typing = bool(data.get('is_typing'))
     room = 'general' if to == 'general' else dm_room(me_user['username'], to)
-    emit('typing', {'from': me_user['username'], 'is_typing': is_typing, 'to': to}, to=room, include_self=False)
+    emit('typing', {'from': me_user['username'], 'is_typing': is_typing, 'to': to},
+         to=room, include_self=False)
 
 
 @socketio.on('read')
@@ -1090,28 +1643,98 @@ def on_read(data):
     emit('read', {'room': room, 'reads': {str(k): v for k, v in reads.items()}}, to=room)
 
 
+# ============ WEBRTC СИГНАЛИНГ ============
+@socketio.on('call_offer')
+def on_call_offer(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    offer = data.get('offer')
+    call_type = data.get('type', 'audio')
+    if not to or not offer: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_offer', {
+            'from': me_user['username'],
+            'offer': offer,
+            'type': call_type,
+        }, to=sid)
+    else:
+        emit('call_reject', {'from': to, 'reason': 'offline'})
+
+
+@socketio.on('call_answer')
+def on_call_answer(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    answer = data.get('answer')
+    if not to or not answer: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_answer', {'from': me_user['username'], 'answer': answer}, to=sid)
+
+
+@socketio.on('call_ice')
+def on_call_ice(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    candidate = data.get('candidate')
+    if not to or not candidate: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_ice', {'from': me_user['username'], 'candidate': candidate}, to=sid)
+
+
+@socketio.on('call_reject')
+def on_call_reject(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    reason = data.get('reason', 'rejected')
+    if not to: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_reject', {'from': me_user['username'], 'reason': reason}, to=sid)
+
+
+@socketio.on('call_end')
+def on_call_end(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    if not to: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_end', {'from': me_user['username']}, to=sid)
+
+
 @socketio.on('disconnect')
 def on_disc():
     u = online.pop(request.sid, None)
     if not u: return
     if name_to_sid.get(u['username'].lower()) == request.sid:
         name_to_sid.pop(u['username'].lower(), None)
-    sys_msg = add_msg('general', None, u['username'], 'system', text=f"{u['username']} покинул чат")
+    sys_msg = add_msg('general', None, u['username'], 'system',
+                      text=f"{u['username']} покинул чат")
     socketio.emit('message', serialize(sys_msg), to='general')
     broadcast_online()
 
 
-# ============================================================
-# ЗАПУСК
 # ============================================================
 init_db()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 55)
-    print("🚀 Holodyx Chat запущен")
-    print(f"   Открой: http://127.0.0.1:{port}")
-    print(f"   БД:     {DB_PATH}")
-    print(f"   Файлы:  {UPLOAD_DIR}")
+    print("🚀 Holodyx Chat v2")
+    print(f"   http://127.0.0.1:{port}")
+    print(f"   БД: {DB_PATH}")
     print("=" * 55)
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
