@@ -1,5 +1,5 @@
 """
-Holodyx Chat v2 — звонки, поиск, минимализм.
+Holodyx Chat v3 — звонки, поиск, Telegram-фон.
 Запуск: python chat.py
 """
 
@@ -25,6 +25,7 @@ os.makedirs(AVATAR_DIR, exist_ok=True)
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 MAX_MEDIA = 50 * 1024 * 1024
+
 
 # ============================================================
 # БД
@@ -331,10 +332,39 @@ button{cursor:pointer;border:none;background:none}
 .chat-item .badge{position:absolute;top:50%;transform:translateY(-50%);right:10px;background:var(--accent);color:#fff;font-size:11px;font-weight:600;padding:2px 6px;border-radius:10px;display:none}
 .chat-item.unread .badge{display:block}
 
-/* MAIN */
-#main{background:var(--bg);display:flex;flex-direction:column;position:relative}
+/* MAIN with Telegram-style background */
+#main{
+  display:flex;flex-direction:column;position:relative;
+  overflow:hidden;
+  background:#0d0f12;
+}
+/* мягкие цветные пятна */
+#main::before{
+  content:'';
+  position:absolute;inset:0;
+  background-image:
+    radial-gradient(circle at 15% 25%, rgba(59,130,246,.10) 0%, transparent 35%),
+    radial-gradient(circle at 85% 15%, rgba(124,92,255,.09) 0%, transparent 30%),
+    radial-gradient(circle at 75% 75%, rgba(59,130,246,.07) 0%, transparent 40%),
+    radial-gradient(circle at 25% 85%, rgba(124,92,255,.06) 0%, transparent 35%),
+    radial-gradient(circle at 50% 50%, rgba(59,130,246,.04) 0%, transparent 50%);
+  pointer-events:none;
+  z-index:0;
+}
+/* паттерн из тонких фигур */
+#main::after{
+  content:'';
+  position:absolute;inset:0;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='280' height='280' viewBox='0 0 280 280'><g fill='none' stroke='rgba(255,255,255,0.04)' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='40' cy='40' r='14'/><path d='M120 20 L140 40 L120 60 L100 40 Z'/><circle cx='230' cy='60' r='9'/><path d='M30 130 q15 -22 30 0 t30 0'/><rect x='100' y='115' width='22' height='22' rx='5' transform='rotate(15 111 126)'/><circle cx='190' cy='140' r='16'/><path d='M230 110 l10 15 l-10 15 l-10 -15 z'/><path d='M50 210 c15 -20 30 -20 45 0'/><circle cx='140' cy='220' r='10'/><rect x='200' y='205' width='26' height='16' rx='4'/><path d='M250 250 q-10 -15 -20 0'/><path d='M170 30 l8 8 l-8 8 l-8 -8 z'/><circle cx='90' cy='230' r='7'/><path d='M20 180 q10 10 20 0'/></g></svg>");
+  background-repeat:repeat;
+  opacity:.85;
+  pointer-events:none;
+  z-index:0;
+}
+#main > *{position:relative;z-index:1}
+
 #chatHeader{padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;min-height:56px}
-#chatHeader .avatar{width:36px;height:36px;border-radius:50%;overflow:hidden;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:var(--text-2);flex-shrink:0}
+#chatHeader .avatar{width:36px;height:36px;border-radius:50%;overflow:hidden;background:#2a3038;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;color:var(--text-2);flex-shrink:0;cursor:pointer}
 #chatHeader .avatar img{width:100%;height:100%;object-fit:cover}
 #chatHeader .info{flex:1;min-width:0}
 #chatHeader .info .title{font-weight:500;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -396,15 +426,16 @@ button{cursor:pointer;border:none;background:none}
 .user-result .status{width:8px;height:8px;border-radius:50%;background:#3a424c;flex-shrink:0}
 .user-result .status.online{background:var(--success)}
 
-/* CALL OVERLAY */
+/* CALL */
 #callScreen{position:fixed;inset:0;background:#000;z-index:200;display:none;flex-direction:column}
 #callScreen.active{display:flex}
 #callScreen .remoteVideo{flex:1;position:relative;overflow:hidden}
 #callScreen .remoteVideo video{width:100%;height:100%;object-fit:cover;background:#000}
-#callScreen .localVideo{position:absolute;bottom:16px;right:16px;width:180px;height:120px;border-radius:10px;overflow:hidden;border:2px solid #2a3038;background:#000;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+#callScreen .localVideo{position:absolute;bottom:16px;right:16px;width:180px;height:120px;border-radius:10px;overflow:hidden;border:2px solid #2a3038;background:#000;box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:5}
 #callScreen .localVideo video{width:100%;height:100%;object-fit:cover}
 #callScreen .remoteVideo .placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;color:#8b929c}
-#callScreen .remoteVideo .placeholder .avatar{width:100px;height:100px;border-radius:50%;background:#2a3038;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:600;color:#e8eaed}
+#callScreen .remoteVideo .placeholder .avatar{width:100px;height:100px;border-radius:50%;background:#2a3038;display:flex;align-items:center;justify-content:center;font-size:36px;font-weight:600;color:#e8eaed;overflow:hidden}
+#callScreen .remoteVideo .placeholder .avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%}
 #callScreen .remoteVideo .placeholder .name{font-size:18px;font-weight:500;color:#e8eaed}
 #callScreen .remoteVideo .placeholder .status{font-size:14px;color:#8b929c}
 #callScreen .controls{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);display:flex;gap:12px;z-index:10}
@@ -446,7 +477,6 @@ button{cursor:pointer;border:none;background:none}
 </head>
 <body>
 
-<!-- AUTH -->
 <div id="auth">
   <h1>Holodyx Chat</h1>
   <div class="sub">Общайтесь, звоните, делитесь медиа</div>
@@ -470,7 +500,6 @@ button{cursor:pointer;border:none;background:none}
   <div class="ok" id="authOk"></div>
 </div>
 
-<!-- APP -->
 <div id="app">
   <aside id="sidebar">
     <div id="sidebarHeader">
@@ -535,7 +564,6 @@ button{cursor:pointer;border:none;background:none}
   </main>
 </div>
 
-<!-- SETTINGS MODAL -->
 <div class="modal-overlay" id="settingsModal">
   <div class="modal">
     <h2>Настройки профиля</h2>
@@ -558,7 +586,6 @@ button{cursor:pointer;border:none;background:none}
   </div>
 </div>
 
-<!-- SEARCH USERS MODAL -->
 <div class="modal-overlay" id="searchUsersModal">
   <div class="modal">
     <h2>Найти человека</h2>
@@ -570,7 +597,6 @@ button{cursor:pointer;border:none;background:none}
   </div>
 </div>
 
-<!-- PEER INFO MODAL -->
 <div class="modal-overlay" id="peerModal">
   <div class="modal">
     <h2>Профиль</h2>
@@ -587,7 +613,6 @@ button{cursor:pointer;border:none;background:none}
   </div>
 </div>
 
-<!-- INCOMING CALL -->
 <div id="incomingModal">
   <div class="box">
     <div class="avatar" id="incomingAvatar">?</div>
@@ -604,7 +629,6 @@ button{cursor:pointer;border:none;background:none}
   </div>
 </div>
 
-<!-- CALL SCREEN -->
 <div id="callScreen">
   <div class="remoteVideo">
     <video id="remoteVideo" autoplay playsinline></video>
@@ -641,7 +665,7 @@ let activeKey = null;
 const onlineUsers = new Map();
 const peerCache = {};
 
-/* ============ AUTH ============ */
+/* AUTH */
 $('tabLogin').onclick = () => switchTab('login');
 $('tabRegister').onclick = () => switchTab('register');
 function switchTab(t) {
@@ -693,20 +717,17 @@ async function doRegister() {
   } catch(e) {}
 })();
 
-/* ============ ENTER APP ============ */
 function enterApp() {
   $('auth').style.display = 'none';
   $('app').classList.add('active');
   const av = $('myAvatarSm');
   av.innerHTML = me.avatar ? `<img src="${me.avatar}">` : initials(me.username);
   $('myNameSm').textContent = me.username;
-
   chats['general'] = { key:'general', type:'general', title:'Общий чат', messages:[], unread:0, typing:false };
-
   if (!socket.connected) socket.connect();
 }
 
-/* ============ SOCKET ============ */
+/* SOCKET */
 socket.on('need_auth', () => socket.disconnect());
 socket.on('connect_error', e => console.warn('Socket:', e.message));
 
@@ -717,11 +738,9 @@ socket.on('joined', data => {
     onlineUsers.set(u.id, u);
     peerCache[u.username.toLowerCase()] = u;
   });
-  // восстановить открытые диалоги
   loadSavedDialogs();
   renderSidebar();
 });
-
 socket.on('online', data => {
   onlineUsers.clear();
   data.users.forEach(u => {
@@ -731,7 +750,6 @@ socket.on('online', data => {
   renderSidebar();
   if (activeKey && activeKey !== 'general') updateHeaderSub();
 });
-
 socket.on('message', msg => {
   const key = msg.room;
   let chat = chats[key];
@@ -747,9 +765,7 @@ socket.on('message', msg => {
   chat.messages.push(msg);
   const isActive = key === activeKey;
   const fromMe = msg.sender_id === me.id;
-  if (!isActive && !fromMe && msg.type !== 'system') {
-    chat.unread = (chat.unread || 0) + 1;
-  }
+  if (!isActive && !fromMe && msg.type !== 'system') chat.unread = (chat.unread || 0) + 1;
   if (isActive) {
     renderMessages(); scrollBottom();
     if (!fromMe && chat.messages.length) {
@@ -758,20 +774,17 @@ socket.on('message', msg => {
   }
   renderSidebar();
 });
-
 socket.on('typing', data => {
   const key = data.to === 'general' ? 'general' : dmKey(data.from, me.username);
   const chat = chats[key]; if (!chat) return;
   chat.typing = data.is_typing;
   if (activeKey === key) updateHeaderSub();
 });
-
 socket.on('read', data => {
   const chat = chats[data.room];
   if (chat) chat.reads = data.reads;
   if (activeKey === data.room) renderMessages();
 });
-
 socket.on('dm_history', data => {
   const key = data.room;
   let chat = chats[key];
@@ -783,7 +796,6 @@ socket.on('dm_history', data => {
   if (activeKey === key) { renderMessages(); scrollBottom(); }
 });
 
-/* ============ HELPERS ============ */
 function initials(n) { if (!n) return '?'; const p = n.trim().split(/\s+/); return (p.length === 1 ? p[0].slice(0,2) : p[0][0]+p[1][0]).toUpperCase(); }
 function parseTime(iso) {
   if (!iso) return null;
@@ -819,7 +831,6 @@ function preview(m) {
 function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function avatarHtml(u) { if (u.avatar) return `<img src="${u.avatar}">`; return initials(u.username || u); }
 
-/* ============ SAVE DIALOGS ============ */
 function saveDialogs() {
   const list = Object.values(chats).filter(c => c.type === 'dm').map(c => c.peer);
   try { localStorage.setItem('holodyx_dialogs', JSON.stringify(list)); } catch(e) {}
@@ -835,7 +846,6 @@ function loadSavedDialogs() {
   } catch(e) {}
 }
 
-/* ============ RENDER ============ */
 function renderSidebar() {
   const q = $('searchInput').value.trim().toLowerCase();
   const entries = Object.values(chats).filter(c => !q || c.title.toLowerCase().includes(q)).sort((a,b) => {
@@ -940,7 +950,6 @@ function renderMessages() {
 }
 function scrollBottom() { requestAnimationFrame(() => { const w = $('messagesWrap'); w.scrollTop = w.scrollHeight; }); }
 
-/* ============ SEND ============ */
 function currentRoom() { const c = chats[activeKey]; if (!c) return null; return c.type === 'general' ? 'general' : dmKey(me.username, c.peer); }
 function send() {
   const text = $('msgInput').value.trim();
@@ -963,7 +972,6 @@ $('msgInput').addEventListener('input', () => {
   typingTimer = setTimeout(() => socket.emit('typing', { is_typing: false, to }), 1200);
 });
 
-/* ============ MEDIA UPLOAD ============ */
 $('attachBtn').onclick = () => $('fileInput').click();
 $('fileInput').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
@@ -982,7 +990,6 @@ async function uploadFile(file, kind, room) {
   } catch(e) { toast('Ошибка сети'); }
 }
 
-/* ============ VOICE ============ */
 let mediaRecorder = null, recordedChunks = [], recStart = 0, recTimer = null;
 $('micBtn').onclick = async () => {
   if (mediaRecorder && mediaRecorder.state === 'recording') { mediaRecorder.stop(); return; }
@@ -1020,7 +1027,6 @@ function getAudioMime() {
   return '';
 }
 
-/* ============ SETTINGS ============ */
 $('settingsBtn').onclick = () => {
   $('setUsername').value = me.username || '';
   $('setBio').value = me.bio || '';
@@ -1055,7 +1061,6 @@ $('settingsSave').onclick = async () => {
 };
 $('logoutBtn').onclick = async () => { await fetch('/api/logout', { method:'POST' }); location.reload(); };
 
-/* ============ SEARCH USERS ============ */
 $('searchUsersBtn').onclick = () => {
   $('searchUsersModal').classList.add('visible');
   $('userSearchInput').value = '';
@@ -1103,8 +1108,6 @@ async function searchUsers() {
   } catch(e) {}
 }
 
-/* ============ PEER INFO ============ */
-$('chatHeader').addEventListener('contextmenu', e => e.preventDefault());
 document.querySelector('#chatHeader .avatar').onclick = () => {
   const c = chats[activeKey]; if (!c || c.type !== 'dm') return;
   const u = peerCache[c.peer.toLowerCase()] || {username: c.peer, avatar: c.avatar, bio: ''};
@@ -1115,16 +1118,11 @@ document.querySelector('#chatHeader .avatar').onclick = () => {
 };
 $('peerClose').onclick = () => $('peerModal').classList.remove('visible');
 
-/* ============ TOAST ============ */
 function toast(t) {
   const el = $('toast'); el.textContent = t; el.classList.add('visible');
   clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('visible'), 2200);
 }
-
-/* ============ SEARCH CHATS ============ */
 $('searchInput').addEventListener('input', renderSidebar);
-
-/* ============ ESC ============ */
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     document.querySelectorAll('.modal-overlay.visible').forEach(m => m.classList.remove('visible'));
@@ -1132,12 +1130,12 @@ document.addEventListener('keydown', e => {
 });
 
 /* ============================================================
-   WEBRTC ЗВОНКИ
+   WEBRTC
 ============================================================ */
 let pc = null;
 let localStream = null;
 let currentCallPeer = null;
-let currentCallType = null; // 'audio' | 'video'
+let currentCallType = null;
 let isCaller = false;
 let pendingCandidates = [];
 let callTimeout = null;
@@ -1155,7 +1153,7 @@ function showCallScreen(peerName, type) {
   $('callName').textContent = peerName;
   $('callStatus').textContent = type === 'video' ? 'Видеозвонок' : 'Аудиозвонок';
   const u = peerCache[peerName.toLowerCase()] || {username: peerName};
-  $('callAvatar').innerHTML = u.avatar ? `<img src="${u.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover">` : initials(peerName);
+  $('callAvatar').innerHTML = u.avatar ? `<img src="${u.avatar}">` : initials(peerName);
   $('callScreen').classList.add('active');
   $('callPlaceholder').style.display = 'flex';
   $('camBtn').style.display = type === 'video' ? 'flex' : 'none';
@@ -1188,7 +1186,6 @@ async function startCall(type) {
     await pc.setLocalDescription(offer);
     socket.emit('call_offer', { to: c.peer, offer, type });
 
-    // автоотмена если не ответили за 30 сек
     callTimeout = setTimeout(() => {
       toast('Нет ответа');
       endCall(true);
@@ -1222,11 +1219,7 @@ $('audioCallBtn').onclick = () => startCall('audio');
 $('videoCallBtn').onclick = () => startCall('video');
 
 function endCall(silent) {
-  if (currentCallPeer && !silent) {
-    socket.emit('call_end', { to: currentCallPeer });
-  } else if (currentCallPeer) {
-    socket.emit('call_end', { to: currentCallPeer });
-  }
+  if (currentCallPeer) socket.emit('call_end', { to: currentCallPeer });
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   if (pc) { try { pc.close(); } catch(e){} pc = null; }
   currentCallPeer = null;
@@ -1237,7 +1230,6 @@ function endCall(silent) {
 }
 $('endCallBtn').onclick = () => endCall(false);
 
-// Mute / Camera toggle
 let micEnabled = true, camEnabled = true;
 $('muteBtn').onclick = () => {
   if (!localStream) return;
@@ -1252,9 +1244,8 @@ $('camBtn').onclick = () => {
   $('camBtn').classList.toggle('active', !camEnabled);
 };
 
-/* --- Socket сигналинг --- */
 socket.on('call_offer', async data => {
-  if (pc) { // заняты
+  if (pc) {
     socket.emit('call_reject', { to: data.from, reason: 'busy' });
     return;
   }
@@ -1295,7 +1286,6 @@ $('acceptCallBtn').onclick = async () => {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    // отправить накопленные ICE
     for (const c of pendingCandidates) {
       try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch(e){}
     }
@@ -1348,7 +1338,6 @@ socket.on('call_end', data => {
     endCall(true);
   }
 });
-
 </script>
 </body>
 </html>
@@ -1506,8 +1495,6 @@ def api_profile():
 
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
-    """ВАЖНО: не рассылаем через socketio.emit — только возвращаем результат.
-    Фронт сам эмитит через 'send_media', чтобы избежать дубликата."""
     uid = session.get('uid')
     if not uid:
         return jsonify(ok=False, error='Не авторизован'), 401
@@ -1538,13 +1525,10 @@ def api_upload():
     msg = add_msg(room=room, sender_id=u['id'], sender_name=u['username'],
                   type_=msg_type, text='', media_url=url, media_name=file.filename)
     payload = serialize(msg)
-    # отправляем только отправителю (он покажет локально)
-    # и собеседникам через комнату, но НЕ дублируем отправителю
     if room == 'general':
         socketio.emit('message', payload, to='general', include_self=False)
         socketio.emit('message', payload, to=request.sid)
     else:
-        # личные: отправителю + получателю
         socketio.emit('message', payload, to=request.sid)
         parts = room[3:].split('|')
         for name in parts:
@@ -1643,7 +1627,6 @@ def on_read(data):
     emit('read', {'room': room, 'reads': {str(k): v for k, v in reads.items()}}, to=room)
 
 
-# ============ WEBRTC СИГНАЛИНГ ============
 @socketio.on('call_offer')
 def on_call_offer(data):
     uid = session.get('uid')
@@ -1733,7 +1716,7 @@ init_db()
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 55)
-    print("🚀 Holodyx Chat v2")
+    print("🚀 Holodyx Chat v3 — с фоном в стиле Telegram")
     print(f"   http://127.0.0.1:{port}")
     print(f"   БД: {DB_PATH}")
     print("=" * 55)
