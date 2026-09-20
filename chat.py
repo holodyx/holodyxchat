@@ -523,3 +523,664 @@ def online_list():
 
 def broadcast_online():
     socketio.emit('online', {'users': online_list()}, to='general')
+    # ============================================================
+# HTTP ROUTES
+# ============================================================
+@app.route('/')
+def index():
+    return Response(INDEX_HTML, mimetype='text/html')
+
+
+@app.route('/health')
+def health():
+    return jsonify(status='ok', online=len(online))
+
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
+
+@app.route('/chat_uploads/avatars/<path:fn>')
+def serve_avatar(fn):
+    return send_from_directory(AVATAR_DIR, fn)
+
+
+@app.route('/chat_uploads/media/<path:fn>')
+def serve_media(fn):
+    return send_from_directory(MEDIA_DIR, fn)
+
+
+@app.route('/chat_uploads/stories/<path:fn>')
+def serve_story(fn):
+    return send_from_directory(STORY_DIR, fn)
+
+
+@app.route('/api/register', methods=['POST'])
+def api_register():
+    try:
+        data = request.get_json(silent=True) or {}
+        email = (data.get('email') or '').strip().lower()
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+            return jsonify(ok=False, error='Некорректный email'), 400
+        if not re.match(r'^[A-Za-zА-Яа-я0-9_]{3,20}$', username):
+            return jsonify(ok=False, error='Ник: 3–20 символов'), 400
+        if len(password) < 6:
+            return jsonify(ok=False, error='Пароль минимум 6 символов'), 400
+        if user_by_email(email):
+            return jsonify(ok=False, error='Email занят'), 400
+        if user_by_username(username):
+            return jsonify(ok=False, error='Ник занят'), 400
+        uid = create_user(email, username, password)
+        if not uid:
+            return jsonify(ok=False, error='Ошибка создания'), 500
+        return jsonify(ok=True, uid=uid)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify(ok=False, error=f'Ошибка: {e}'), 500
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    login = (data.get('login') or '').strip()
+    password = data.get('password') or ''
+    user = user_by_email(login) if '@' in login else None
+    if not user:
+        user = user_by_username(login)
+    if not user or not check_password_hash(user['password_hash'], password):
+        return jsonify(ok=False, error='Неверный логин или пароль'), 401
+    session['uid'] = user['id']
+    session.permanent = True
+    update_last_seen(user['id'])
+    return jsonify(ok=True, user={
+        'id': user['id'], 'username': user['username'],
+        'avatar': user['avatar'], 'bio': user['bio'], 'email': user['email'],
+        'phone': user.get('phone', ''), 'premium': user.get('premium', 0),
+    })
+
+
+@app.route('/api/me')
+def api_me():
+    uid = session.get('uid')
+    if not uid:
+        return jsonify(ok=False), 401
+    u = user_by_id(uid)
+    if not u:
+        session.clear()
+        return jsonify(ok=False), 401
+    return jsonify(ok=True, user={
+        'id': u['id'], 'username': u['username'],
+        'avatar': u['avatar'], 'bio': u['bio'], 'email': u['email'],
+        'phone': u.get('phone', ''), 'premium': u.get('premium', 0),
+    })
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+@app.route('/api/users/search')
+def api_users_search():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 1: return jsonify(ok=True, users=[])
+    users = search_users(q, uid, 20)
+    return jsonify(ok=True, users=users)
+
+
+@app.route('/api/dialogs')
+def api_dialogs():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    return jsonify(ok=True, dialogs=list_dialogs(uid))
+
+
+@app.route('/api/settings', methods=['GET'])
+def api_get_settings():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    return jsonify(ok=True, settings=get_settings(uid))
+
+
+@app.route('/api/settings', methods=['POST'])
+def api_save_settings():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    data = request.get_json(silent=True) or {}
+    save_settings(uid, data)
+    return jsonify(ok=True)
+
+
+@app.route('/api/premium', methods=['POST'])
+def api_premium():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    data = request.get_json(silent=True) or {}
+    action = data.get('action')
+    if action == 'activate':
+        set_premium(uid, True)
+    elif action == 'deactivate':
+        set_premium(uid, False)
+    u = user_by_id(uid)
+    return jsonify(ok=True, premium=u.get('premium', 0))
+
+
+@app.route('/api/profile', methods=['POST'])
+def api_profile():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False, error='Не авторизован'), 401
+    u = user_by_id(uid)
+    if not u: return jsonify(ok=False, error='Нет юзера'), 404
+
+    username = request.form.get('username')
+    bio = request.form.get('bio')
+    phone = request.form.get('phone')
+    updates = {}
+
+    if username and username != u['username']:
+        if not re.match(r'^[A-Za-zА-Яа-я0-9_]{3,20}$', username):
+            return jsonify(ok=False, error='Некорректный ник'), 400
+        if user_by_username(username):
+            return jsonify(ok=False, error='Ник занят'), 400
+        updates['username'] = username
+    if bio is not None:
+        updates['bio'] = bio.strip()[:300]
+    if phone is not None:
+        updates['phone'] = phone.strip()[:30]
+
+    file = request.files.get('avatar')
+    if file and file.filename:
+        if ext_of(file.filename) not in ALLOWED_AVATAR:
+            return jsonify(ok=False, error='Формат не поддерживается'), 400
+        fn = f"{uuid.uuid4().hex}.{ext_of(file.filename)}"
+        file.save(os.path.join(AVATAR_DIR, fn))
+        updates['avatar'] = f"/chat_uploads/avatars/{fn}"
+
+    if updates:
+        update_profile(uid, **updates)
+    nu = user_by_id(uid)
+    return jsonify(ok=True, user={
+        'id': nu['id'], 'username': nu['username'],
+        'avatar': nu['avatar'], 'bio': nu['bio'], 'email': nu['email'],
+        'phone': nu.get('phone', ''), 'premium': nu.get('premium', 0),
+    })
+
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False, error='Не авторизован'), 401
+    file = request.files.get('file')
+    kind = (request.form.get('kind') or 'file').lower()
+    room = request.form.get('room') or 'general'
+    if not file or not file.filename:
+        return jsonify(ok=False, error='Файл не выбран'), 400
+    ext = ext_of(file.filename)
+    if kind == 'image':
+        if ext not in ALLOWED_IMAGE: return jsonify(ok=False, error='Не поддерживается'), 400
+        msg_type = 'image'
+    elif kind == 'video':
+        if ext not in ALLOWED_VIDEO: return jsonify(ok=False, error='Не поддерживается'), 400
+        msg_type = 'video'
+    elif kind == 'audio':
+        if ext not in ALLOWED_AUDIO: return jsonify(ok=False, error='Не поддерживается'), 400
+        msg_type = 'audio'
+    else:
+        return jsonify(ok=False, error='Неизвестный тип'), 400
+
+    fn = f"{uuid.uuid4().hex}.{ext}"
+    file.save(os.path.join(MEDIA_DIR, fn))
+    url = f"/chat_uploads/media/{fn}"
+    u = user_by_id(uid)
+    msg = add_msg(room=room, sender_id=u['id'], sender_name=u['username'],
+                  type_=msg_type, text='', media_url=url, media_name=file.filename)
+    payload = serialize(msg)
+    if room == 'general':
+        socketio.emit('message', payload, to='general', include_self=False)
+        socketio.emit('message', payload, to=request.sid)
+    elif room.startswith('group:'):
+        socketio.emit('message', payload, to=room, include_self=False)
+        socketio.emit('message', payload, to=request.sid)
+    else:
+        socketio.emit('message', payload, to=request.sid)
+        parts = room[3:].split('|')
+        for name in parts:
+            sid = name_to_sid.get(name)
+            if sid and sid != request.sid:
+                socketio.emit('message', payload, to=sid)
+    return jsonify(ok=True, message=payload)
+
+
+# ============ GROUPS / CHANNELS API ============
+
+@app.route('/api/groups', methods=['POST'])
+def api_create_group():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False, error='Не авторизован'), 401
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()[:60]
+    type_ = data.get('type', 'group')
+    about = (data.get('about') or '').strip()[:200]
+    members = data.get('members') or []
+
+    if not name:
+        return jsonify(ok=False, error='Введите название'), 400
+    if type_ not in ('group', 'channel'):
+        return jsonify(ok=False, error='Неверный тип'), 400
+
+    gid = create_group(name, type_, uid, about)
+    # добавить участников
+    for username in members:
+        u = user_by_username(username)
+        if u and u['id'] != uid:
+            add_group_member(gid, u['id'])
+
+    # системное сообщение
+    g = get_group(gid)
+    room = group_room(gid)
+    sys_msg = add_msg(room, None, 'system', 'system',
+                      text=f"{g['type'] == 'channel' and 'Канал' or 'Группа'} «{g['name']}» создан")
+    socketio.emit('message', serialize(sys_msg), to=room)
+
+    return jsonify(ok=True, group=dict(g))
+
+
+@app.route('/api/groups', methods=['GET'])
+def api_list_groups():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    groups = user_groups(uid)
+    return jsonify(ok=True, groups=groups)
+
+
+@app.route('/api/groups/<int:gid>')
+def api_get_group(gid):
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    if not is_group_member(gid, uid):
+        return jsonify(ok=False, error='Нет доступа'), 403
+    g = get_group(gid)
+    if not g: return jsonify(ok=False, error='Не найдено'), 404
+    members = group_members(gid)
+    return jsonify(ok=True, group=g, members=members)
+
+
+@app.route('/api/groups/<int:gid>/members', methods=['POST'])
+def api_add_members(gid):
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    if not is_group_member(gid, uid): return jsonify(ok=False), 403
+    data = request.get_json(silent=True) or {}
+    usernames = data.get('usernames') or []
+    added = []
+    for username in usernames:
+        u = user_by_username(username)
+        if u:
+            add_group_member(gid, u['id'])
+            added.append(u['username'])
+    # системное сообщение
+    if added:
+        room = group_room(gid)
+        msg = add_msg(room, None, 'system', 'system',
+                      text=f"Добавлены: {', '.join(added)}")
+        socketio.emit('message', serialize(msg), to=room)
+    return jsonify(ok=True, added=added)
+
+
+@app.route('/api/groups/<int:gid>/leave', methods=['POST'])
+def api_leave_group(gid):
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    remove_group_member(gid, uid)
+    room = group_room(gid)
+    u = user_by_id(uid)
+    msg = add_msg(room, None, 'system', 'system', text=f"{u['username']} покинул чат")
+    socketio.emit('message', serialize(msg), to=room)
+    return jsonify(ok=True)
+
+
+# ============ STORIES API ============
+
+@app.route('/api/stories/feed')
+def api_stories_feed():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    feed = active_stories(exclude_uid=uid)
+    mine = my_stories(uid)
+    my = None
+    if mine:
+        u = user_by_id(uid)
+        my = {
+            'user_id': uid,
+            'username': u['username'],
+            'avatar': u['avatar'],
+            'stories': [{
+                'id': s['id'], 'type': s['type'], 'media_url': s['media_url'],
+                'text': s['text'], 'bg_color': s['bg_color'],
+                'created_at': s['created_at'],
+            } for s in mine],
+            'has_unviewed': False,
+            'is_me': True,
+        }
+    feed = [f for f in feed if f['user_id'] != uid]
+    return jsonify(ok=True, my=my, others=feed)
+
+
+@app.route('/api/stories', methods=['POST'])
+def api_create_story():
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    stype = request.form.get('type', 'image')
+    text = (request.form.get('text') or '').strip()[:200]
+    bg_color = request.form.get('bg_color', '#3b82f6')
+
+    if stype not in ('image', 'video', 'text'):
+        return jsonify(ok=False, error='Неверный тип'), 400
+
+    media_url = None
+    file = request.files.get('file')
+    if file and file.filename:
+        ext = ext_of(file.filename)
+        if stype == 'image' and ext not in ALLOWED_IMAGE:
+            return jsonify(ok=False, error='Неверный формат'), 400
+        if stype == 'video' and ext not in ALLOWED_VIDEO:
+            return jsonify(ok=False, error='Неверный формат'), 400
+        fn = f"{uuid.uuid4().hex}.{ext}"
+        file.save(os.path.join(STORY_DIR, fn))
+        media_url = f"/chat_uploads/stories/{fn}"
+
+    sid = create_story(uid, stype, media_url, text, bg_color)
+    socketio.emit('story_created', {'user_id': uid}, to='general')
+    return jsonify(ok=True, story_id=sid)
+
+
+@app.route('/api/stories/<int:sid>/view', methods=['POST'])
+def api_view_story(sid):
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    view_story(sid, uid)
+    return jsonify(ok=True)
+
+
+@app.route('/api/stories/<int:sid>/viewers')
+def api_story_viewers(sid):
+    uid = session.get('uid')
+    if not uid: return jsonify(ok=False), 401
+    return jsonify(ok=True, viewers=story_viewers(sid))# ============================================================
+# SOCKET
+# ============================================================
+@socketio.on('connect')
+def on_connect():
+    uid = session.get('uid')
+    if not uid: emit('need_auth'); return
+    u = user_by_id(uid)
+    if not u: emit('need_auth'); return
+
+    update_last_seen(uid)
+    online[request.sid] = {
+        'id': u['id'], 'username': u['username'],
+        'avatar': u['avatar'], 'bio': u['bio'], 'premium': u.get('premium', 0),
+    }
+    name_to_sid[u['username'].lower()] = request.sid
+    join_room('general')
+    join_room(f"user:{u['id']}")
+
+    # подписаться на комнаты всех групп пользователя
+    for gid in user_groups_ids(u['id']):
+        join_room(group_room(gid))
+
+    emit('joined', {
+        'user': {
+            'id': u['id'], 'username': u['username'],
+            'avatar': u['avatar'], 'bio': u['bio'], 'email': u['email'],
+            'phone': u.get('phone', ''), 'premium': u.get('premium', 0),
+        },
+        'history': history('general', 200),
+        'online': online_list(),
+        'groups': user_groups(u['id']),
+        'settings': get_settings(u['id']),
+    })
+
+    sys_msg = add_msg('general', None, u['username'], 'system',
+                      text=f"{u['username']} присоединился к чату")
+    emit('message', serialize(sys_msg), to='general')
+    broadcast_online()
+
+
+@socketio.on('open_dm')
+def on_open_dm(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    peer = (data.get('peer') or '').strip()
+    if not peer: return
+    add_dialog(me_user['id'], peer)
+    room = dm_room(me_user['username'], peer)
+    join_room(room)
+    emit('dm_history', {'room': room, 'peer': peer, 'history': history(room, 200)})
+
+
+@socketio.on('open_group')
+def on_open_group(data):
+    uid = session.get('uid')
+    if not uid: return
+    gid = int(data.get('gid') or 0)
+    if not gid: return
+    if not is_group_member(gid, uid): return
+    room = group_room(gid)
+    join_room(room)
+    g = get_group(gid)
+    emit('group_history', {
+        'room': room,
+        'group': g,
+        'members': group_members(gid),
+        'history': history(room, 200),
+    })
+
+
+@socketio.on('send')
+def on_send(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    if not me_user: return
+    text = (data.get('text') or '').strip()[:4000]
+    to = (data.get('to') or 'general').strip()
+    if not text: return
+
+    # группа / канал
+    if to.startswith('group:'):
+        gid = int(to.split(':', 1)[1])
+        g = get_group(gid)
+        if not g: return
+        if not is_group_member(gid, uid): return
+        # в канале писать может только владелец/админ
+        if g['type'] == 'channel':
+            conn = db()
+            role = conn.execute(
+                "SELECT role FROM group_members WHERE group_id = ? AND user_id = ?",
+                (gid, uid)
+            ).fetchone()
+            conn.close()
+            if not role or role['role'] not in ('owner', 'admin'):
+                emit('error_msg', {'msg': 'В канале пишет только владелец'})
+                return
+        room = group_room(gid)
+        msg = add_msg(room=room, sender_id=me_user['id'],
+                      sender_name=me_user['username'], type_='text', text=text)
+        emit('message', serialize(msg), to=room)
+        return
+
+    # личка / общий
+    if to == 'general':
+        room = 'general'
+    else:
+        room = dm_room(me_user['username'], to)
+
+    msg = add_msg(room=room, sender_id=me_user['id'],
+                  sender_name=me_user['username'], type_='text', text=text)
+    payload = serialize(msg)
+    if room == 'general':
+        emit('message', payload, to='general')
+    else:
+        add_dialog(me_user['id'], to)
+        emit('message', payload)
+        sid = name_to_sid.get(to.lower())
+        if sid:
+            emit('message', payload, to=sid)
+
+
+@socketio.on('typing')
+def on_typing(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    if not me_user: return
+    to = (data.get('to') or 'general').strip()
+    is_typing = bool(data.get('is_typing'))
+
+    if to.startswith('group:'):
+        room = to
+    elif to == 'general':
+        room = 'general'
+    else:
+        room = dm_room(me_user['username'], to)
+
+    emit('typing', {'from': me_user['username'], 'is_typing': is_typing, 'to': to},
+         to=room, include_self=False)
+
+
+@socketio.on('read')
+def on_read(data):
+    uid = session.get('uid')
+    if not uid: return
+    room = data.get('room')
+    last_id = int(data.get('last_id') or 0)
+    if not room: return
+    mark_read(uid, room, last_id)
+    reads = reads_for_room(room)
+    emit('read', {'room': room, 'reads': {str(k): v for k, v in reads.items()}}, to=room)
+
+
+# ---------- Группы через сокет ----------
+@socketio.on('group_created')
+def on_group_created(data):
+    """Клиент сообщает, что создал группу — сервер подписывает всех участников."""
+    gid = int(data.get('gid') or 0)
+    if not gid: return
+    g = get_group(gid)
+    if not g: return
+    for m in group_members(gid):
+        sid = name_to_sid.get(m['username'].lower())
+        if sid:
+            emit('group_added', {'group': g}, to=sid)
+            emit('join_group_room', {'gid': gid}, to=sid)
+
+
+@socketio.on('join_group_room')
+def on_join_group_room(data):
+    gid = int(data.get('gid') or 0)
+    if not gid: return
+    join_room(group_room(gid))
+
+
+# ---------- WebRTC ----------
+@socketio.on('call_offer')
+def on_call_offer(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    offer = data.get('offer')
+    call_type = data.get('type', 'audio')
+    if not to or not offer: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_offer', {'from': me_user['username'], 'offer': offer, 'type': call_type}, to=sid)
+    else:
+        emit('call_reject', {'from': to, 'reason': 'offline'})
+
+
+@socketio.on('call_answer')
+def on_call_answer(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    answer = data.get('answer')
+    if not to or not answer: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_answer', {'from': me_user['username'], 'answer': answer}, to=sid)
+
+
+@socketio.on('call_ice')
+def on_call_ice(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    candidate = data.get('candidate')
+    if not to or not candidate: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_ice', {'from': me_user['username'], 'candidate': candidate}, to=sid)
+
+
+@socketio.on('call_reject')
+def on_call_reject(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    reason = data.get('reason', 'rejected')
+    if not to: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_reject', {'from': me_user['username'], 'reason': reason}, to=sid)
+
+
+@socketio.on('call_end')
+def on_call_end(data):
+    uid = session.get('uid')
+    if not uid: return
+    me_user = user_by_id(uid)
+    to = (data.get('to') or '').strip()
+    if not to: return
+    sid = name_to_sid.get(to.lower())
+    if sid:
+        emit('call_end', {'from': me_user['username']}, to=sid)
+
+
+@socketio.on('disconnect')
+def on_disc():
+    u = online.pop(request.sid, None)
+    if not u: return
+    if name_to_sid.get(u['username'].lower()) == request.sid:
+        name_to_sid.pop(u['username'].lower(), None)
+    try:
+        update_last_seen(u['id'])
+    except: pass
+    sys_msg = add_msg('general', None, u['username'], 'system',
+                      text=f"{u['username']} покинул чат")
+    socketio.emit('message', serialize(sys_msg), to='general')
+    broadcast_online()
+
+
+# ============================================================
+init_db()
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print("=" * 55)
+    print("🚀 Holodyx Chat v5 — каналы, группы, истории")
+    print(f"   http://127.0.0.1:{port}")
+    print(f"   БД: {DB_PATH}")
+    print("=" * 55)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
